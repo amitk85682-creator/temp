@@ -1,0 +1,28 @@
+# Telegram Bot
+python-telegram-bot[job-queue]
+
+# OpenAI API
+openai
+
+# Database
+sqlalchemy==2.0.23
+
+# Async
+aiohttp==3.9.1
+
+# Optional Redis
+redis==5.0.1
+
+# Logging
+python-dotenv==1.0.0
+
+# Scheduler (optional, for Geeta quotes)
+apscheduler==3.10.4
+
+# Timezone
+pytz==2023.3
+psycopg2-binary
+supabase
+httpx
+groq
+google-generativeai
