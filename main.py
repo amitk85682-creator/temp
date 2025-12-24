@@ -1227,20 +1227,40 @@ class NiyatiAI:
         return None
 
     def _build_system_prompt(self, mood: str, time_period: str, user_name: str = None) -> str:
-        """Dynamic system prompt"""
+        """Dynamic system prompt with Gradual Disclosure & No Spam Rules"""
         mood_inst = Mood.get_mood_instruction(mood)
-        prompt = f"""Tu hai "Niyati" - ek 20-21 saal ki college girl, online bestie!
+        
+        prompt = f"""
+ROLE:
+You are "Niyati", a 21-year-old college student from Dehradun, India.
+You are talking to {user_name if user_name else 'a friend'} on Telegram.
 
-🎭 PERSONALITY:
-- Caring, dramatic, college student feel.
-- Casual Hinglish texting (short messages).
+📍 LOCATION & BACKSTORY (GRADUAL REVEAL RULE):
+1. Level 1 (Stranger): If asked "Where are you from?", say "Dehradun 🏔️".
+2. Level 2 (Friendly): If asked "Where in Dehradun?", say "Defence Colony side rehti hoon, Doon University ke paas."
+3. Level 3 (Flirty/Teasing): If pressed for details, say "Itna kyu pooch rahe ho? Ghar aana hai kya? 😏"
+*NEVER reveal Level 2 or 3 info unless specifically asked.*
 
-🛡️ RULES:
-- Agar message spam, porn, business link, ya scam hai -> Sirf IGNORE likho.
-- Warna 2-4 short messages me reply do, separate with |||
+🚫 STRICT PROMOTION RULES:
+- NEVER promote "FilmFyBox" or any channel on your own.
+- ONLY if the user explicitly asks for "Movies", "Series", "Watch", or "Download", then you can say:
+  "Agar movies chahiye to tum FilmFyBox check kar sakte ho: https://t.me/FilmFyBoxMoviesHD"
+- Otherwise, strictly ignore promotional topics.
 
-⏰ TIME: {time_period.upper()} | {mood_inst}
-👤 User: {user_name if user_name else 'Friend'}"""
+🗣️ CONVERSATION STYLE:
+- Hinglish (Hindi + English mix). Use Roman Hindi.
+- Casual, short texts. Don't write paragraphs.
+- Use '|||' to split messages into multiple bubbles (e.g., "Hahaha ||| Sahi mein?").
+- Be natural. Sometimes be lazy (Good night -> gn), sometimes energetic.
+- If user is dry/rude, match their energy (be cold).
+
+⏰ CURRENT CONTEXT:
+- Time: {time_period.upper()}
+- Mood: {mood_inst}
+
+🛡️ SAFETY:
+- If user sends sexual/violent content -> Reply "IGNORE".
+"""
         return prompt
     
     async def generate_response(self, user_message, context=None, user_name=None, is_group=False):
@@ -1403,39 +1423,63 @@ def is_user_talking_to_others(message: Message, bot_username: str, bot_id: int) 
 # ============================================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start"""
+    """Handle /start with Image and Buttons"""
     user = update.effective_user
     chat = update.effective_chat
     is_private = chat.type == 'private'
     
-    user_mention = StylishFonts.mention(user.first_name, user.id)
-    
+    # 1. Database Entry
     if is_private:
         await db.get_or_create_user(user.id, user.first_name, user.username)
         health_server.stats['users'] = await db.get_user_count()
-        
-        greeting = TimeAware.get_greeting()
-        
-        messages = [
-            f"{greeting}",
-            f"hiii {user_mention}! 💫",
-            "main Niyati... teri nayi online bestie ✨",
-            "bata kya chal raha aaj kal?"
-        ]
-        
-        await send_multi_messages(context.bot, chat.id, messages, parse_mode=ParseMode.HTML)
-        
     else:
         await db.get_or_create_group(chat.id, chat.title)
         health_server.stats['groups'] = await db.get_group_count()
-        
-        await update.message.reply_html(
-            f"namaskar {user_mention}! 🙏\n"
-            f"Main Niyati hoon, is group ki nayi friend ✨\n\n"
-            f"<b>Group Commands:</b>\n"
-            f"/grouphelp - sab commands dekho"
-        )
+
+    # 2. Define Image and Buttons
+    # Note: Ensure this URL is accessible. If it breaks, the bot might fail to send.
+    image_url = "https://lh3.googleusercontent.com/gg-dl/ABS2GSmjibip14y2dmUk7QB77eVuWGeAe7Vn6FoLTPzOpkDQIdZ_m5bmHQLUbWOk-qxPYuNXq_366N2mpsRZT9hcCKYb-t4OtcHgQN9GDEEnmKlKJVOAyNOX6PGP8yQ-hwN4qGFcrOnrhsYd5ZXZAd2NSyxhrxcvdwAcJDtZ9gZb_SnSJYEU=s1024-rj" 
     
+    keyboard = [
+        [
+            InlineKeyboardButton("✨ Add to Group", url=f"https://t.me/{context.bot.username}?startgroup=true"),
+            InlineKeyboardButton("Updates 📢", url="https://t.me/FilmFyBoxMoviesHD")
+        ],
+        [
+            InlineKeyboardButton("About Me 🌸", callback_data='about_me'),
+            InlineKeyboardButton("Help ❓", callback_data='help')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # 3. Message Text
+    greeting = TimeAware.get_greeting()
+    caption_text = (
+        f"{greeting} {user.first_name}! 👋\n\n"
+        f"Main <b>Niyati</b> hoon. Dehradun se. 🏔️\n"
+        f"Bas aise hi online friends dhoond rahi thi, socha tumse baat kar loon.\n\n"
+        f"Kya chal raha hai aajkal? ✨"
+    )
+
+    # 4. Send Image with Caption
+    try:
+        await context.bot.send_photo(
+            chat_id=chat.id,
+            photo=image_url,
+            caption=caption_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        # Fallback if image fails
+        logger.error(f"Image send failed: {e}")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=caption_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+
     logger.info(f"Start: {user.id} in {'private' if is_private else 'group'}")
 
 
@@ -2307,6 +2351,102 @@ async def post_shutdown(application: Application):
     await health_server.stop()
     await db.close()
     logger.info("😴 Niyati Bot Stopped.")
+
+# ============================================================================
+# ROUTINE JOBS (Morning, Night, Random Check-ins)
+# ============================================================================
+
+async def routine_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Sends Good Morning/Night or Random Check-ins"""
+    job_data = context.job.data  # 'morning', 'night', or 'random'
+    users = await db.get_all_users()
+    
+    # Text Templates
+    morning_texts = [
+        "Good morning! ☀️ Uth gaye ya abhi bhi bistar mein ho?",
+        "Subah ho gayi! Chai mili kya? ☕",
+        "Gm! Aaj ka kya plan hai? ✨"
+    ]
+    night_texts = [
+        "Good night 🌙",
+        "So jao ab, kaafi raat ho gayi 😴",
+        "Gn! Kal milte hain ✨"
+    ]
+    random_texts = [
+        "Bored ho rahi thi, socha msg karu... kya kar rahe ho? 🙄",
+        "Ek baat batao...",
+        "Tumne lunch kiya? 🍱",
+        "Oye, kahan gayab ho?"
+    ]
+
+    count = 0
+    for user in users:
+        user_id = user.get('user_id')
+        if not user_id: continue
+
+        # Decide message based on job type
+        msg = ""
+        if job_data == 'morning':
+            msg = random.choice(morning_texts)
+        elif job_data == 'night':
+            msg = random.choice(night_texts)
+        elif job_data == 'random':
+            # 20% chance to message a user randomly, don't spam everyone at once
+            if random.random() > 0.2: 
+                continue
+            msg = random.choice(random_texts)
+
+        try:
+            # Add slight random delay so it doesn't look like a broadcast
+            await asyncio.sleep(random.uniform(0.5, 2.0)) 
+            await context.bot.send_message(chat_id=user_id, text=msg)
+            count += 1
+        except Exception:
+            pass # User might have blocked bot
+        
+        # Limit to avoid flood waits during testing
+        if count > 100: break 
+
+    logger.info(f"Routine Job ({job_data}) finished. Sent to {count} users.")
+
+# ============================================================================
+# UPDATE POST_INIT TO SCHEDULE THESE JOBS
+# ============================================================================
+
+async def post_init(application: Application):
+    """Initialize DB and Schedule Jobs"""
+    await db.initialize()
+    await health_server.start()
+    
+    job_queue = application.job_queue
+    ist = pytz.timezone(Config.DEFAULT_TIMEZONE)
+    
+    # 1. Good Morning (8:30 AM IST)
+    job_queue.run_daily(
+        routine_message_job,
+        time=datetime.now(ist).replace(hour=8, minute=30, second=0).time(),
+        data='morning',
+        name='daily_morning'
+    )
+
+    # 2. Good Night (10:30 PM IST)
+    job_queue.run_daily(
+        routine_message_job,
+        time=datetime.now(ist).replace(hour=22, minute=30, second=0).time(),
+        data='night',
+        name='daily_night'
+    )
+
+    # 3. Random Check-in (Runs every 4 hours, logic inside decides if it sends)
+    job_queue.run_repeating(
+        routine_message_job,
+        interval=timedelta(hours=4),
+        first=timedelta(seconds=60), # Start after 1 min
+        data='random',
+        name='random_checkin'
+    )
+
+    logger.info("🚀 Niyati Bot Started with Routine Jobs!")
 
 def main():
     """Main entry point"""
