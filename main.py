@@ -53,7 +53,7 @@ from telegram import (
     Chat,
     Message,
     BotCommand,
-    MessageEntity
+    MessageEntity,
     InputMediaPhoto
 )
 from telegram.ext import (
