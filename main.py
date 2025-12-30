@@ -29,7 +29,8 @@ import logging
 import asyncio
 import re
 import random
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timedelta, timezone, time as dt_time
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
@@ -53,6 +54,7 @@ from telegram import (
     Message,
     BotCommand,
     MessageEntity
+    InputMediaPhoto
 )
 from telegram.ext import (
     Application,
@@ -89,26 +91,10 @@ class Config:
     BOT_USERNAME = os.getenv('BOT_USERNAME', 'Niyati_personal_bot')
     
     # OpenAI (Multi-Key Support)
-    OPENAI_API_KEYS_STR = os.getenv('OPENAI_API_KEYS', '')
-    
-    if not OPENAI_API_KEYS_STR:
-        OPENAI_API_KEYS_STR = os.getenv('OPENAI_API_KEY', '')
-        
-    API_KEYS_LIST = [k.strip() for k in OPENAI_API_KEYS_STR.split(',') if k.strip()]
-    
-    OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
-    OPENAI_MAX_TOKENS = int(os.getenv('OPENAI_MAX_TOKENS', '200'))
-    OPENAI_TEMPERATURE = float(os.getenv('OPENAI_TEMPERATURE', '0.85'))
-
     # Groq
     GROQ_API_KEYS_STR = os.getenv('GROQ_API_KEYS', '')
     GROQ_API_KEYS_LIST = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
     GROQ_MODEL = "llama-3.3-70b-versatile"
-    
-    # Gemini
-    GEMINI_MODEL = "gemini-2.5-flash"
-    GEMINI_API_KEYS_STR = os.getenv('GEMINI_API_KEYS', '')
-    GEMINI_API_KEYS_LIST = [k.strip() for k in GEMINI_API_KEYS_STR.split(',') if k.strip()]
 
     # Supabase (Cloud PostgreSQL)
     SUPABASE_URL = os.getenv('SUPABASE_URL', '')
@@ -157,11 +143,13 @@ class Config:
         if not cls.TELEGRAM_BOT_TOKEN:
             errors.append("TELEGRAM_BOT_TOKEN required")
         
-        if not cls.API_KEYS_LIST and not cls.GROQ_API_KEYS_LIST and not cls.GEMINI_API_KEYS_LIST:
-            errors.append("At least one API key (OpenAI/Groq/Gemini) required")
+        # FIX: Ab hum sirf GROQ check karenge, purane keys nahi
+        if not cls.GROQ_API_KEYS_LIST:
+            errors.append("GROQ_API_KEYS required in .env")
             
         if not cls.SUPABASE_URL or not cls.SUPABASE_KEY:
             print("⚠️ Supabase not configured - using local storage only")
+            
         if errors:
             raise ValueError(f"Config errors: {', '.join(errors)}")
 
@@ -535,6 +523,45 @@ class Database:
             logger.info(f"✅ New user (local): {user_id} ({first_name})")
         
         return self.local_users[user_id]
+    
+    # Add these inside Database class
+    async def add_user_memory(self, user_id: int, note: str):
+        """Adds a short note to user's active memory"""
+        # Hum existing preferences column use karenge taaki naya table na banana pade
+        prefs = await self.get_user_preferences(user_id)
+        
+        # Existing memories uthao ya nayi list banao
+        memories = prefs.get('active_memories', [])
+        
+        # Add new note with timestamp
+        new_note = {
+            'note': note,
+            'added_at': datetime.now(timezone.utc).isoformat(),
+            'status': 'active' # active means abhi tak pucha nahi hai
+        }
+        memories.append(new_note)
+        
+        # Keep only last 5 active memories to save space
+        memories = memories[-5:]
+        
+        # Save back to DB
+        prefs['active_memories'] = memories
+        
+        # Update DB using existing function logic
+        if self.connected and self.client:
+            await self.client.update('users', {
+                'preferences': json.dumps(prefs),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }, {'user_id': user_id})
+        elif user_id in self.local_users:
+            self.local_users[user_id]['preferences'] = prefs
+
+    async def get_active_memories(self, user_id: int) -> List[str]:
+        """Gets pending memories to ask about"""
+        prefs = await self.get_user_preferences(user_id)
+        memories = prefs.get('active_memories', [])
+        # Sirf wahi return karo jo purane na ho gaye ho (24 hours logic later)
+        return [m['note'] for m in memories if m.get('status') == 'active']
     
     async def get_user_context(self, user_id: int) -> List[Dict]:
         """Get user conversation context"""
@@ -1121,110 +1148,37 @@ class ContentFilter:
         return any(kw in text_lower for kw in ContentFilter.DISTRESS_KEYWORDS)
 
 # ============================================================================
-# AI ASSISTANT - NIYATI
+# AI ASSISTANT - GROQ SPECIAL EDITION 🚀
 # ============================================================================
 
 class NiyatiAI:
-    """Hybrid AI: OpenAI -> Groq -> Gemini (Auto-Failover)"""
+    """Super Fast Groq AI with Multi-Key Rotation"""
     
     def __init__(self):
-        self.openai_keys = getattr(Config, 'API_KEYS_LIST', [])
-        self.groq_keys = Config.GROQ_API_KEYS_LIST
-        self.gemini_keys = Config.GEMINI_API_KEYS_LIST
-        
-        # Merge all keys with priority
-        self.all_keys = []
-        for k in self.openai_keys:
-            self.all_keys.append({"type": "openai", "key": k})
-        for k in self.groq_keys:
-            self.all_keys.append({"type": "groq", "key": k})
-        for k in self.gemini_keys:
-            self.all_keys.append({"type": "gemini", "key": k})
-        
+        self.keys = Config.GROQ_API_KEYS_LIST
         self.current_index = 0
         self.client = None
         self._initialize_client()
-        logger.info(f"🤖 Hybrid AI initialized with {len(self.all_keys)} total keys.")
+        logging.info(f"🚀 AI initialized with {len(self.keys)} Groq Keys!")
 
     def _initialize_client(self):
-        """Initialize Client based on Key Type"""
-        if not self.all_keys:
-            logger.error("❌ No API Keys found!")
-            return
-            
-        current = self.all_keys[self.current_index]
-        
-        if current['type'] == "openai":
-            self.client = AsyncOpenAI(api_key=current['key'])
-        elif current['type'] == "groq":
-            self.client = AsyncOpenAI(
-                base_url="https://api.groq.com/openai/v1", 
-                api_key=current['key']
-            )
-        
-        masked = current['key'][:8] + "..." + current['key'][-4:]
-        logger.info(f"🔑 Current AI: {current['type'].upper()} | Key: {masked}")
+        """Current Key se Client banata hai"""
+        if not self.keys: return
+        key = self.keys[self.current_index]
+        # Groq OpenAI compatible client use karta hai
+        self.client = AsyncOpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=key
+        )
+        masked = key[:6] + "..." + key[-4:]
+        logging.info(f"🔑 Switched to Groq Key: {masked}")
 
-    def _rotate(self):
-        """Switch to next key when one fails"""
-        if len(self.all_keys) <= 1:
-            return False
-        self.current_index = (self.current_index + 1) % len(self.all_keys)
+    def _rotate_key(self):
+        """Jab ek key thak jaye, to agli key lagata hai"""
+        if len(self.keys) <= 1: return False
+        self.current_index = (self.current_index + 1) % len(self.keys)
         self._initialize_client()
         return True
-
-    async def _call_gpt(self, messages, max_tokens=200, temp=0.8):
-        """Unified caller for OpenAI, Groq, and Gemini"""
-        attempts = len(self.all_keys) if self.all_keys else 1
-        
-        for _ in range(attempts):
-            if not self.all_keys:
-                break
-                
-            curr = self.all_keys[self.current_index]
-            try:
-                # OpenAI or Groq
-                if curr['type'] in ["openai", "groq"]:
-                    model_name = "gpt-4o-mini" if curr['type'] == "openai" else "llama-3.3-70b-versatile"
-                    response = await self.client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temp,
-                        presence_penalty=0.6
-                    )
-                    return response.choices[0].message.content.strip()
-
-                # Gemini
-                elif curr['type'] == "gemini":
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{Config.GEMINI_MODEL}:generateContent?key={curr['key']}"
-                    
-                    # Convert messages to Gemini format
-                    contents = []
-                    for m in messages:
-                        if m['role'] == 'system':
-                            contents.append({"role": "user", "parts": [{"text": f"[System]: {m['content']}"}]})
-                        else:
-                            role = "model" if m['role'] == "assistant" else "user"
-                            contents.append({"role": role, "parts": [{"text": m['content']}]})
-                    
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.post(url, json={
-                            "contents": contents,
-                            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temp}
-                        })
-                        if resp.status_code == 200:
-                            return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                        else:
-                            raise Exception(f"Gemini Error: {resp.status_code}")
-
-            except Exception as e:
-                logger.warning(f"❌ {curr['type'].upper()} Key Failed: {str(e)[:50]}. Rotating...")
-                await asyncio.sleep(1)
-                if not self._rotate():
-                    break
-                
-        return None
 
     def _build_system_prompt(self, mood: str, time_period: str, user_name: str = None) -> str:
         """Dynamic system prompt with Gradual Disclosure & No Spam Rules"""
@@ -1262,6 +1216,71 @@ You are talking to {user_name if user_name else 'a friend'} on Telegram.
 - If user sends sexual/violent content -> Reply "IGNORE".
 """
         return prompt
+
+    async def _call_gpt(self, messages):
+        """This function was missing! It makes the actual call to Groq."""
+        if not self.client: self._initialize_client()
+        
+        attempts = len(self.keys)
+        for _ in range(attempts):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=Config.GROQ_MODEL,
+                    messages=messages,
+                    max_tokens=250,
+                    temperature=0.8,
+                    presence_penalty=0.4
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logging.warning(f"⚠️ Groq Error: {e}. Rotating key...")
+                if not self._rotate_key():
+                    break
+                await asyncio.sleep(0.5)
+        
+        return None
+
+    # Update inside NiyatiAI class
+    async def extract_important_info(self, user_message: str) -> str:
+        """Checks if message has ANY important life event + Time"""
+        
+        # 1. Expanded Triggers (Mental State + Events + Time)
+        triggers = [
+            # Events
+            'exam', 'test', 'interview', 'date', 'meeting', 'party', 'shadi', 'wedding',
+            'trip', 'travel', 'flight', 'train', 'bus', 'hospital', 'doctor',
+            # Emotions/State
+            'bimar', 'sick', 'sad', 'happy', 'excited', 'tired', 'thak', 'low', 'cry', 'ro',
+            'breakup', 'love', 'crush', 'fight', 'gussa',
+            # Time Markers (Sabse Important)
+            'kal', 'aaj', 'today', 'tomorrow', 'subah', 'shaam', 'raat', 'tonight', 'morning'
+        ]
+        
+        # Agar message bohot chota hai (e.g. "Hi", "Hru") to ignore karo
+        if len(user_message.split()) < 3:
+            return None
+
+        # Agar trigger word nahi hai, to bhi 10% chance pe check kar lo (Random intuition)
+        if not any(t in user_message.lower() for t in triggers) and random.random() > 0.1:
+            return None
+            
+        # 2. AI se pucho: "Kya hai aur KAB hai?"
+        prompt = f"""
+        Analyze user message: "{user_message}"
+        
+        Task: Extract any future event, plan, or current state.
+        CRITICAL: Capture the TIME if mentioned (e.g., "Exam at 2pm", "Going out tonight").
+        
+        Output Format: "Event Details @ Time/Context"
+        Example: "Maths Exam @ 2 PM to 5 PM" or "Feeling sick @ currently"
+        
+        If nothing important to remember, output "None".
+        """
+        note = await self._call_gpt([{"role": "user", "content": prompt}], max_tokens=30)
+        
+        if note and "None" not in note:
+            return note
+        return None
     
     async def generate_response(self, user_message, context=None, user_name=None, is_group=False):
         mood = Mood.get_random_mood()
@@ -1285,12 +1304,12 @@ You are talking to {user_name if user_name else 'a friend'} on Telegram.
 
     async def generate_shayari(self, mood="neutral"):
         prompt = f"Write a 2 line heart-touching Hinglish shayari for {mood} mood."
-        res = await self._call_gpt([{"role": "user", "content": prompt}], max_tokens=100, temp=0.9)
+        res = await self._call_gpt([{"role": "user", "content": prompt}])
         return f"✨ {res} ✨" if res else "Waah waah! ✨"
 
     async def generate_geeta_quote(self):
         prompt = "Give a short Bhagavad Gita quote with Hinglish meaning. Start with 🙏"
-        res = await self._call_gpt([{"role": "user", "content": prompt}], max_tokens=150)
+        res = await self._call_gpt([{"role": "user", "content": prompt}])
         return res if res else "🙏 Karm karo phal ki chinta mat karo."
 
     async def get_random_bonus(self):
@@ -1438,7 +1457,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. Define Image and Buttons
     # Note: Ensure this URL is accessible. If it breaks, the bot might fail to send.
-    image_url = "https://lh3.googleusercontent.com/gg-dl/ABS2GSmjibip14y2dmUk7QB77eVuWGeAe7Vn6FoLTPzOpkDQIdZ_m5bmHQLUbWOk-qxPYuNXq_366N2mpsRZT9hcCKYb-t4OtcHgQN9GDEEnmKlKJVOAyNOX6PGP8yQ-hwN4qGFcrOnrhsYd5ZXZAd2NSyxhrxcvdwAcJDtZ9gZb_SnSJYEU=s1024-rj" 
+    image_url = "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEg3SXTHtV16aCxOpfFX0HQ9KDxSIVx5n61A7fU1YfLGSRSnSxDqkji1io2BxFdQa5nJx0dMRepfT39SZLCak3WYtMNQt_M2avzBERqHikXkoL30uzAw0DjrHRsckAEzc2rxI5JELc6rz6Cu5-NTlo0O3wLZiuTBJsqgiYe4MgK0QbtMm-9W8cOL9b-DzUE/s1600/Gemini_Generated_Image_dtpe5sdtpe5sdtpe.png" 
     
     keyboard = [
         [
@@ -1887,7 +1906,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 import html  # ✅ Import this at top
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast message to all users AND groups (Fixed & Robust)"""
+    """Broadcast message to all users AND groups (Fixed Version)"""
     if not await admin_check(update):
         return
 
@@ -1905,64 +1924,88 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Message likho ya reply karo!")
         return
 
-    status_msg = await update.message.reply_text("📢 Starting Broadcast... (0/0)")
+    status_msg = await update.message.reply_text("📢 fetching database... wait")
 
-    # ✅ FIX 1: Fetch ALL users using Loop (Supabase 1000 Limit Bypass)
-    # Note: db.get_all_users ko bhi update karna padega (neeche dekhein)
-    users = await db.get_all_users() 
+    # ✅ FIX 1: Users aur Groups dono ko fetch karna
+    users = await db.get_all_users()
+    groups = await db.get_all_groups()
+
+    # ✅ FIX 2: Targets List banana (User IDs + Group Chat IDs)
+    targets = []
     
+    # Add Users
+    for user in users:
+        uid = user.get('user_id')
+        if uid: targets.append(uid)
+        
+    # Add Groups
+    for group in groups:
+        gid = group.get('chat_id')
+        if gid: targets.append(gid)
+
+    # Stats setup
     success = 0
     failed = 0
-    total = len(users)
+    total = len(targets)
+    
+    if total == 0:
+        await status_msg.edit_text("❌ Database empty hai! Koi users ya groups nahi mile.")
+        return
+
+    await status_msg.edit_text(f"📢 Starting Broadcast to {len(users)} Users & {len(groups)} Groups...")
 
     # Message Content Setup
     final_text = html.escape(message_text) if message_text else None
 
-    for i, user in enumerate(users):
-        user_id = user.get('user_id')
-        if not user_id: continue
-
+    # ✅ FIX 3: Combined Loop for Users & Groups
+    for i, chat_id in enumerate(targets):
         try:
             if reply_msg:
                 # Forward or Copy (Copy is safer for privacy)
                 await context.bot.copy_message(
-                    chat_id=user_id,
+                    chat_id=chat_id,
                     from_chat_id=update.effective_chat.id,
                     message_id=reply_msg.message_id
                 )
             else:
                 await context.bot.send_message(
-                    chat_id=user_id,
+                    chat_id=chat_id,
                     text=final_text,
                     parse_mode=ParseMode.HTML
                 )
             success += 1
         except Forbidden:
-            failed += 1 # User blocked bot
-            # Optional: Delete user from DB here
+            failed += 1 # User blocked bot or kicked from group
         except RetryAfter as e:
-            # ✅ FIX 2: FloodWait Handling
+            # FloodWait Handling
             logger.warning(f"FloodWait: Sleeping {e.retry_after}s")
             await asyncio.sleep(e.retry_after)
-            # Retry current user (simple logic: just skip or complex recursion)
             failed += 1 
         except Exception as e:
             failed += 1
-            logger.error(f"Broadcast error for {user_id}: {e}")
+            logger.error(f"Broadcast error for {chat_id}: {e}")
 
-        # ✅ FIX 3: Update Status every 20 users (Not every user)
+        # Status Update (Har 20 messages ke baad update karega taaki fast rahe)
         if i % 20 == 0:
             try:
-                await status_msg.edit_text(f"📢 Broadcasting: {i}/{total}\n✅ Sent: {success}\n❌ Failed: {failed}")
+                await status_msg.edit_text(
+                    f"📢 Broadcasting...\n"
+                    f"🔄 Progress: {i}/{total}\n"
+                    f"✅ Success: {success}\n"
+                    f"❌ Failed: {failed}"
+                )
             except: pass
         
-        await asyncio.sleep(0.05) # Small delay
+        await asyncio.sleep(0.05) # Small delay to prevent ban
 
+    # Final Report
     await status_msg.edit_text(
         f"✅ <b>Broadcast Complete!</b>\n\n"
-        f"👥 Total: {total}\n"
+        f"👥 Total Targets: {total}\n"
+        f"👤 Users: {len(users)}\n"
+        f"🛡Groups: {len(groups)}\n\n"
         f"✅ Success: {success}\n"
-        f"❌ Blocked/Failed: {failed}"
+        f"❌ Failed/Blocked: {failed}"
     )
     await update.message.reply_html(report)
 
@@ -2165,60 +2208,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.log_user_activity(user.id, "private_message")
 
     # ════════════════════════════════════════════════════════════════════
-    # AI RESPONSE
+    # AI RESPONSE & MEMORY LOGIC
     # ════════════════════════════════════════════════════════════════════
     try:
-        try:
-            await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-        except:
-            pass
+        await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 
+        # 1. GENERATE REPLY
         context_msgs = await db.get_user_context(user.id) if is_private else []
-        
         responses = await niyati_ai.generate_response(
             user_message=user_message,
             context=context_msgs,
             user_name=user.first_name,
             is_group=is_group
         )
-        
-        # Random Bonus (Private only)
-        if is_private and random.random() < 0.1:
-            prefs = await db.get_user_preferences(user.id)
-            bonus = await niyati_ai.get_random_bonus()
-            
-            if bonus:
-                is_shayari = "shayari" in str(bonus).lower() or "\n" in str(bonus)
-                if is_shayari and not prefs.get('shayari_enabled', True):
-                    bonus = None
-                elif not is_shayari and not prefs.get('meme_enabled', True):
-                    bonus = None
-                
-                if bonus:
-                    responses.append(bonus)
-        
+
+        # 2. SMART MEMORY EXTRACTION (Background Task)
+        # Ye user ko pata nahi chalega, par Niyati note bana legi
+        if is_private:
+            memory_note = await niyati_ai.extract_important_info(user_message)
+            if memory_note:
+                await db.add_user_memory(user.id, memory_note)
+                logger.info(f"🧠 Memory stored for {user.first_name}: {memory_note}")
+
+        # 3. SEND MESSAGES (Existing Logic)
         if responses:
-            await send_multi_messages(
-                context.bot,
-                chat.id,
-                responses,
-                reply_to=message.message_id if is_group else None,
-                parse_mode=ParseMode.HTML
-            )
-        
-        # Save History (Private Only)
-        if is_private and responses:
-            await db.save_message(user.id, 'user', user_message)
-            await db.save_message(user.id, 'assistant', ' '.join(responses))
+            await send_multi_messages(context.bot, chat.id, responses, 
+                                    reply_to=message.message_id if is_group else None, 
+                                    parse_mode=ParseMode.HTML)
             
-        health_server.stats['messages'] += 1
-        
+            # Save History
+            if is_private:
+                await db.save_message(user.id, 'user', user_message)
+                await db.save_message(user.id, 'assistant', ' '.join(responses))
+                
     except Exception as e:
-        logger.error(f"❌ Message handling error: {e}", exc_info=True)
-        try:
-            await message.reply_text("oops kuch gadbad... retry karo? 🫶")
-        except:
-            pass
+        logger.error(f"Handler Error: {e}")
 
 
 # ============================================================================
@@ -2227,8 +2251,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle new members joining group"""
+    # Safety check: Ensure message and new_chat_members exist
+    if not update.message or not update.message.new_chat_members:
+        return
+
     chat = update.effective_chat
-    
     if chat.type not in ['group', 'supergroup']:
         return
     
@@ -2271,6 +2298,114 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
+# 🔒 SECRET DIARY FEATURE (Talkie Style)
+# ============================================================================
+
+async def send_locked_diary_card(context: ContextTypes.DEFAULT_TYPE):
+    """Sends the LOCKED card notification at night"""
+    users = await db.get_all_users()
+    
+    # Image: LOCKED (Blurry or Lock Icon)
+    locked_image = "https://images.unsplash.com/photo-1517639493569-5666a7488662?w=600&q=80&blur=50" 
+    
+    for user in users:
+        user_id = user.get('user_id')
+        if not user_id: continue
+
+        keyboard = [[InlineKeyboardButton("✨ Unlock Memory ✨", callback_data="unlock_diary")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        caption = (
+            "🔒 <b>Secret Memory Created!</b>\n\n"
+            "Niyati SECRET DIARY.\n"
+            "Card unlock karke padhne ke liye tap karein..."
+        )
+
+        try:
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=locked_image,
+                caption=caption,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            await asyncio.sleep(1) # Anti-flood wait
+        except Exception:
+            pass
+
+    logger.info("🔒 Locked Diary Cards sent to all users!")
+
+async def diary_unlock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the Card Reveal AND The Nervous Reaction"""
+    query = update.callback_query
+    user = update.effective_user
+    
+    # 1. Loading Effect
+    await query.answer("Unlocking memory... 🗝️")
+    
+    # Image: Unlocked (Clear Photo)
+    unlocked_image = "https://images.unsplash.com/photo-1517639493569-5666a7488662?w=800&q=80"
+
+    # 2. Generate Diary Text (On the fly)
+    history = await db.get_user_context(user.id)
+    
+    prompt = [
+        {"role": "system", "content": f"""
+        You are Niyati. Write a SHORT Diary Entry (max 3 sentences) about chatting with {user.first_name}.
+        Start with "Dear Diary...".
+        Format: Hinglish. Emotional/Secretive. Reveal a small hidden feeling.
+        """},
+        {"role": "user", "content": str(history)}
+    ]
+    
+    diary_text = await niyati_ai._call_gpt(prompt)
+    if not diary_text:
+        diary_text = "Dear Diary... Aaj inse baat karke acha laga, par thaki hu. Kal likhungi! 😴"
+
+    final_caption = (
+        f"🔓 <b>Unlocked: Niyati's Diary</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"<i>{diary_text}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"✨ Saved to Memories"
+    )
+
+    # 3. The "Card Flip" (Visual Update)
+    try:
+        await query.edit_message_media(
+            media=InputMediaPhoto(media=unlocked_image, caption=final_caption, parse_mode=ParseMode.HTML)
+        )
+    except Exception as e:
+        logger.error(f"Diary unlock failed: {e}")
+        return
+
+    # ════════════════════════════════════════════════════════════
+    # 🔴 THE REACTION LOGIC (Wait & Reply)
+    # ════════════════════════════════════════════════════════════
+    
+    # Step 4: Wait for User to Read (10 Seconds)
+    await asyncio.sleep(10) 
+
+    # Step 5: Nervous Reaction
+    try:
+        await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
+        await asyncio.sleep(1.5)
+        
+        reaction_1 = "Oye! Tumne meri diary padh li? 😳"
+        await context.bot.send_message(chat_id=user.id, text=reaction_1)
+
+        # Step 6: Follow-up Question (3 Seconds later)
+        await asyncio.sleep(3)
+        await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
+        await asyncio.sleep(1.5)
+        
+        reaction_2 = "Pls judge mat karna... wese, tumhe bura to nahi laga na? 👉👈"
+        await context.bot.send_message(chat_id=user.id, text=reaction_2)
+        
+    except Exception as e:
+        logger.error(f"Reaction failed: {e}")
+        
+# ============================================================================
 # BOT SETUP
 # ============================================================================
 
@@ -2298,10 +2433,11 @@ def setup_handlers(app: Application):
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("adminhelp", adminhelp_command))
+    app.add_handler(CallbackQueryHandler(diary_unlock_callback, pattern="^unlock_diary$"))
 
     # Message Handlers
-    # 1. New Member (Welcome)
-    app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+    # 1. New Member (Welcome) - FIXED: Uses MessageHandler with StatusUpdate filter
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member))
     
     # 2. Main Message Handler (Text & Group Logic)
     # Filters.text & ~Filters.command ensures we only catch text that isn't a command
@@ -2315,36 +2451,47 @@ def setup_handlers(app: Application):
 # ============================================================================
 
 async def post_init(application: Application):
-    """
-    Bot start hone ke baad ye function chalega.
-    Iska use hum Health Server start karne ke liye karenge.
-    """
+    """Initialize DB and Schedule Jobs with CORRECT UTC TIMING"""
     await db.initialize()
     await health_server.start()
     
-    # Schedule Daily Geeta Job (Daily at 8:00 AM IST)
     job_queue = application.job_queue
-    ist = pytz.timezone(Config.DEFAULT_TIMEZONE)
-    # Time set kar rahe hain (UTC convert hoke manage hoga automatically agar timezone aware object hai)
-    daily_time = datetime.now(ist).replace(hour=8, minute=0, second=0, microsecond=0)
     
-    # Timezone object pass karna zaruri hai
+    # 1. Good Morning (India: 08:30 AM IST = 03:00 AM UTC)
     job_queue.run_daily(
-        send_daily_geeta, 
-        time=daily_time.time(), 
-        days=(0, 1, 2, 3, 4, 5, 6),
-        data=None,  # Data argument
-        name="daily_geeta",
-        chat_id=None,
-        user_id=None,
-        job_kwargs={'misfire_grace_time': 60} # Agar server late ho to 60s tak try kare
+        routine_message_job,
+        # ERROR WAS HERE: changed 'time' to 'dt_time'
+        time=dt_time(hour=3, minute=0, second=0),  
+        data='morning',
+        name='daily_morning'
     )
-    # Note: Ensure your PTB Application is initialized with defaults if timezone issues persist, 
-    # but passing UTC time usually works best.
-    # Easy Fix: Convert your desired IST time to UTC manually here.
-    # Agar 8:00 AM IST chahiye -> 2:30 AM UTC set karo.
-    
-    logger.info("🚀 Niyati Bot Started Successfully!")
+
+    # 2. Good Night (India: 10:30 PM IST = 05:00 PM UTC)
+    job_queue.run_daily(
+        routine_message_job,
+        # ERROR WAS HERE: changed 'time' to 'dt_time'
+        time=dt_time(hour=17, minute=0, second=0), 
+        data='night',
+        name='daily_night'
+    )
+
+    # 3. Random Check-in (Runs every 4 hours)
+    job_queue.run_repeating(
+        routine_message_job,
+        interval=timedelta(hours=4),
+        first=timedelta(seconds=60),
+        data='random',
+        name='random_checkin'
+    )
+
+    # 4. Secret Diary (India: 10:30 PM IST = 5:00 PM UTC)
+    job_queue.run_daily(
+        send_locked_diary_card,
+        time=dt_time(hour=17, minute=0, second=0), # 17:00 UTC = 10:30 PM IST
+        name='locked_diary_job'
+    )
+
+    logger.info("🚀 Niyati Bot Started with FIXED Timings (IST)!")
 
 async def post_shutdown(application: Application):
     """Bot band hone par cleanup"""
@@ -2357,96 +2504,133 @@ async def post_shutdown(application: Application):
 # ============================================================================
 
 async def routine_message_job(context: ContextTypes.DEFAULT_TYPE):
-    """Sends Good Morning/Night or Random Check-ins"""
-    job_data = context.job.data  # 'morning', 'night', or 'random'
+    """Sends Messages with REAL HUMAN TIMING CHECK"""
+    job_data = context.job.data
+    
+    # 1. Get Current Time (India)
+    ist = pytz.timezone(Config.DEFAULT_TIMEZONE)
+    now = datetime.now(ist)
+    current_time_str = now.strftime("%I:%M %p") # e.g., "03:30 PM"
+    current_hour = now.hour
+
+    # DND Check (Raat 11 se Subah 8 band)
+    if job_data == 'random' and (current_hour >= 23 or current_hour < 8):
+        return
+
     users = await db.get_all_users()
     
-    # Text Templates
-    morning_texts = [
-        "Good morning! ☀️ Uth gaye ya abhi bhi bistar mein ho?",
-        "Subah ho gayi! Chai mili kya? ☕",
-        "Gm! Aaj ka kya plan hai? ✨"
-    ]
-    night_texts = [
-        "Good night 🌙",
-        "So jao ab, kaafi raat ho gayi 😴",
-        "Gn! Kal milte hain ✨"
-    ]
-    random_texts = [
-        "Bored ho rahi thi, socha msg karu... kya kar rahe ho? 🙄",
-        "Ek baat batao...",
-        "Tumne lunch kiya? 🍱",
-        "Oye, kahan gayab ho?"
-    ]
+    # Fallback Generic Texts
+    morning_texts = ["Good morning! ☀️", "Uth gaye? ✨"]
+    night_texts = ["Good night 🌙", "So jao ab 😴"]
+    random_texts = ["Kya chal raha hai?", "Yaad aa rahi thi..."]
 
     count = 0
     for user in users:
         user_id = user.get('user_id')
         if not user_id: continue
 
-        # Decide message based on job type
-        msg = ""
-        if job_data == 'morning':
-            msg = random.choice(morning_texts)
-        elif job_data == 'night':
-            msg = random.choice(night_texts)
-        elif job_data == 'random':
-            # 20% chance to message a user randomly, don't spam everyone at once
-            if random.random() > 0.2: 
-                continue
-            msg = random.choice(random_texts)
+        # 🧠 MEMORY CHECK
+        memories = await db.get_active_memories(user_id)
+        final_msg = ""
+        
+        if memories:
+            memory_context = " | ".join(memories)
+            
+            # 🔥 THE SMART CHECK PROMPT
+            # Hum AI ko Current Time bata rahe hain
+            prompt = f"""
+            Role: You are Niyati (Girlfriend/Bestie).
+            Current Time in India: {current_time_str}
+            User's Memory Note: "{memory_context}"
+            
+            Task: Decide if you should ask about this memory NOW.
+            
+            🧠 COMMON SENSE RULES:
+            1. If event is in FUTURE -> Say "All the best for [Time]!"
+            2. If event is HAPPENING NOW -> OUTPUT "SKIP" (Don't disturb).
+            3. If event is OVER -> Ask "Kaisa hua?"
+            
+            4. ⚠️ CRITICAL - IF DURATION IS UNKNOWN:
+               - Assume Standard Durations:
+                 * Exam = 3 hours
+                 * Movie = 3 hours
+                 * Date/Meeting = 2 hours
+                 * Travel = Depends on context
+               
+               Example: User said "Exam at 2 PM" (End time unknown).
+               - If Current Time is 3 PM -> Assume Exam is running -> OUTPUT "SKIP".
+               - If Current Time is 6 PM -> Assume Exam over -> Ask "Kaisa gaya?".
+               
+               *Better to ask LATE than EARLY.*
+            
+            Output: The Message to send (Hinglish). If you should wait/skip, output "SKIP".
+            """
+            
+            check_response = await niyati_ai._call_gpt([{"role": "user", "content": prompt}], max_tokens=60)
+            
+            # Agar AI ne bola SKIP, to hum Generic message bhi nahi bhejenge (Disturb nahi karna)
+            if check_response and "SKIP" in check_response:
+                continue 
+                
+            if check_response:
+                final_msg = check_response
+
+        # Agar Memory logic ne kuch nahi diya, to Generic bhej do
+        if not final_msg:
+            if job_data == 'morning': final_msg = random.choice(morning_texts)
+            elif job_data == 'night': final_msg = random.choice(night_texts)
+            elif job_data == 'random':
+                if random.random() > 0.2: continue
+                final_msg = random.choice(random_texts)
 
         try:
-            # Add slight random delay so it doesn't look like a broadcast
-            await asyncio.sleep(random.uniform(0.5, 2.0)) 
-            await context.bot.send_message(chat_id=user_id, text=msg)
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            await context.bot.send_message(chat_id=user_id, text=final_msg)
             count += 1
         except Exception:
-            pass # User might have blocked bot
+            pass
         
-        # Limit to avoid flood waits during testing
-        if count > 100: break 
+        if count > 100: break
 
-    logger.info(f"Routine Job ({job_data}) finished. Sent to {count} users.")
+    logger.info(f"Routine Job ({job_data}) sent to {count} users.")
 
 # ============================================================================
 # UPDATE POST_INIT TO SCHEDULE THESE JOBS
 # ============================================================================
 
 async def post_init(application: Application):
-    """Initialize DB and Schedule Jobs"""
+    """Initialize DB and Schedule Jobs with CORRECT UTC TIMING"""
     await db.initialize()
     await health_server.start()
     
     job_queue = application.job_queue
-    ist = pytz.timezone(Config.DEFAULT_TIMEZONE)
     
-    # 1. Good Morning (8:30 AM IST)
+    # 1. Good Morning (India: 08:30 AM IST = 03:00 AM UTC)
     job_queue.run_daily(
         routine_message_job,
-        time=datetime.now(ist).replace(hour=8, minute=30, second=0).time(),
+        time=dt_time(hour=3, minute=0, second=0),  # <--- FIXED: uses dt_time
         data='morning',
         name='daily_morning'
     )
 
-    # 2. Good Night (10:30 PM IST)
+    # 2. Good Night (India: 10:30 PM IST = 05:00 PM UTC)
     job_queue.run_daily(
         routine_message_job,
-        time=datetime.now(ist).replace(hour=22, minute=30, second=0).time(),
+        time=dt_time(hour=17, minute=0, second=0), # <--- FIXED: uses dt_time
         data='night',
         name='daily_night'
     )
 
-    # 3. Random Check-in (Runs every 4 hours, logic inside decides if it sends)
+    # 3. Random Check-in (Runs every 4 hours)
     job_queue.run_repeating(
         routine_message_job,
         interval=timedelta(hours=4),
-        first=timedelta(seconds=60), # Start after 1 min
+        first=timedelta(seconds=60),
         data='random',
         name='random_checkin'
     )
 
-    logger.info("🚀 Niyati Bot Started with Routine Jobs!")
+    logger.info("🚀 Niyati Bot Started with FIXED Timings (IST)!")
 
 def main():
     """Main entry point"""
