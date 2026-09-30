@@ -58,5 +58,6 @@ def test_file_labels_separate_title_resolution_source_and_episode():
 def test_unknown_suggestion_offers_request_instead_of_silent_return():
     assert "This title is not available yet" not in MAIN_SOURCE
     assert "अभी database में available नहीं है" in MAIN_SOURCE
-    assert 'callback_data=f"request_prefill_{request_title}"' in MAIN_SOURCE
+    assert 'request_callback = "request_prefill_"' in MAIN_SOURCE
+    assert "_not_found_keyboard(query, suggestions)" in MAIN_SOURCE
     assert "Open Request Portal" in MAIN_SOURCE

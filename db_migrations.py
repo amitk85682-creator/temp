@@ -412,6 +412,141 @@ def _migration_9(conn):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_tmdb_id ON movies (tmdb_id)")
 
 
+def _migration_10(conn):
+    """Add normalized episode links and durable ingestion evidence."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS seasons (
+                id BIGSERIAL PRIMARY KEY,
+                movie_id INTEGER NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+                season_number INTEGER NOT NULL CHECK (season_number >= 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (movie_id, season_number)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS episodes (
+                id BIGSERIAL PRIMARY KEY,
+                season_id BIGINT NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+                episode_number INTEGER NOT NULL CHECK (episode_number > 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (season_id, episode_number)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_episodes (
+                movie_file_id INTEGER NOT NULL REFERENCES movie_files(id) ON DELETE CASCADE,
+                episode_id BIGINT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+                PRIMARY KEY (movie_file_id, episode_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_seasons (
+                movie_file_id INTEGER NOT NULL REFERENCES movie_files(id) ON DELETE CASCADE,
+                season_id BIGINT NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+                PRIMARY KEY (movie_file_id, season_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingestion_evidence (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_file_unique_id TEXT UNIQUE,
+                raw_caption TEXT NOT NULL DEFAULT '',
+                raw_filename TEXT NOT NULL DEFAULT '',
+                evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+                parsed_identity JSONB NOT NULL DEFAULT '{}'::jsonb,
+                provider_ids JSONB NOT NULL DEFAULT '{}'::jsonb,
+                resolved_movie_id INTEGER REFERENCES movies(id) ON DELETE SET NULL,
+                movie_file_id INTEGER REFERENCES movie_files(id) ON DELETE SET NULL,
+                resolver_method TEXT NOT NULL DEFAULT '',
+                confidence NUMERIC(4,3) NOT NULL DEFAULT 0
+                    CHECK (confidence BETWEEN 0 AND 1),
+                status TEXT NOT NULL DEFAULT 'resolved'
+                    CHECK (status IN ('resolved', 'pending_review', 'rejected', 'failed')),
+                warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS content_identity_repair_archive (
+                id BIGSERIAL PRIMARY KEY,
+                wrong_movie_id INTEGER NOT NULL UNIQUE,
+                canonical_movie_id INTEGER NOT NULL,
+                original_movie JSONB NOT NULL,
+                related_rows JSONB NOT NULL DEFAULT '{}'::jsonb,
+                audit_report JSONB NOT NULL DEFAULT '{}'::jsonb,
+                archived_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                restored_at TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION ensure_file_episode_parent_match()
+            RETURNS trigger AS $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM movie_files mf
+                    JOIN episodes ep ON ep.id = NEW.episode_id
+                    JOIN seasons s ON s.id = ep.season_id
+                    WHERE mf.id = NEW.movie_file_id AND mf.movie_id = s.movie_id
+                ) THEN
+                    RAISE EXCEPTION 'file and episode must belong to the same movie';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        cur.execute("DROP TRIGGER IF EXISTS file_episodes_parent_match ON file_episodes")
+        cur.execute("""
+            CREATE TRIGGER file_episodes_parent_match
+            BEFORE INSERT OR UPDATE ON file_episodes
+            FOR EACH ROW EXECUTE FUNCTION ensure_file_episode_parent_match()
+        """)
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION ensure_file_season_parent_match()
+            RETURNS trigger AS $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM movie_files mf
+                    JOIN seasons s ON s.id = NEW.season_id
+                    WHERE mf.id = NEW.movie_file_id AND mf.movie_id = s.movie_id
+                ) THEN
+                    RAISE EXCEPTION 'file and season must belong to the same movie';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        cur.execute("DROP TRIGGER IF EXISTS file_seasons_parent_match ON file_seasons")
+        cur.execute("""
+            CREATE TRIGGER file_seasons_parent_match
+            BEFORE INSERT OR UPDATE ON file_seasons
+            FOR EACH ROW EXECUTE FUNCTION ensure_file_season_parent_match()
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_seasons_movie_id ON seasons(movie_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_episodes_season_id ON episodes(season_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_episodes_episode_id ON file_episodes(episode_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_seasons_season_id ON file_seasons(season_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingestion_evidence_movie_id "
+            "ON ingestion_evidence(resolved_movie_id)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingestion_evidence_status_created "
+            "ON ingestion_evidence(status, created_at DESC)"
+        )
+
+
 MIGRATIONS: Tuple[Migration, ...] = (
     (1, _migration_1),
     (2, _migration_2),
@@ -422,6 +557,7 @@ MIGRATIONS: Tuple[Migration, ...] = (
     (7, _migration_7),
     (8, _migration_8),
     (9, _migration_9),
+    (10, _migration_10),
 )
 
 

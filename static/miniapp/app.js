@@ -2390,11 +2390,27 @@ document.addEventListener('keydown', (e) => {
             const sharedMovieId = urlParams.get('movie');
             
             if (reqQuery) {
+                const requestedTitle = reqQuery.trim().slice(0, 200);
                 const searchInput = document.getElementById('searchInput');
-                searchInput.value = reqQuery;
+                searchInput.value = requestedTitle;
                 showToast("🔍 Finding correct spelling...");
                 // Search ko trigger karo
                 searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                const confirmRequest = () => window.requestMovie(requestedTitle);
+                if (typeof tg.showPopup === 'function') {
+                    tg.showPopup({
+                        title: 'Request this title?',
+                        message: `Send a request for "${requestedTitle}"?`,
+                        buttons: [
+                            { id: 'request', type: 'ok', text: 'Request' },
+                            { id: 'cancel', type: 'cancel' }
+                        ]
+                    }, button => {
+                        if (button && button.id === 'request') confirmRequest();
+                    });
+                } else if (window.confirm(`Send a request for "${requestedTitle}"?`)) {
+                    confirmRequest();
+                }
             }
             if (sharedMovieId) {
                 const cachedMovie = allMovies.find(movie => String(movie.id) === String(sharedMovieId));

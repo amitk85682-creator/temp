@@ -14,9 +14,17 @@ import requests
 import signal
 import sys
 import concurrent.futures
+from collections import OrderedDict
+from dataclasses import asdict
 from html import escape as html_escape
 from PIL import Image, ImageOps
 from db_migrations import run_migrations
+from content_identity import (
+    can_create_canonical_content,
+    is_safe_canonical_title,
+    parse_content_identity,
+    resolve_raw_content_identity,
+)
 from telegram import WebAppInfo
 from telegram import MenuButtonWebApp, WebAppInfo
 import aiohttp
@@ -24,7 +32,7 @@ import aiohttp
 from flask import jsonify
 from flask_cors import CORS
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, urlunparse, quote, unquote
+from urllib.parse import urlparse, urlunparse, quote, unquote, urlencode
 from collections import defaultdict
 from telegram.error import RetryAfter, TelegramError
 from typing import Optional
@@ -43,21 +51,32 @@ logger = logging.getLogger(__name__)
 
 # ==================== CACHING ====================
 class FastCache:
-    def __init__(self, ttl_seconds=3600):
-        self.cache = {}
+    def __init__(self, ttl_seconds=3600, max_entries=1024):
+        self.cache = OrderedDict()
         self.ttl = ttl_seconds
+        self.max_entries = max_entries
+        self.lock = threading.RLock()
 
     def get(self, key):
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self.cache[key]
-        return None
+        with self.lock:
+            if key not in self.cache:
+                return None
+            data, timestamp = self.cache.pop(key)
+            if time.time() - timestamp >= self.ttl:
+                return None
+            self.cache[key] = (data, timestamp)
+            return data
 
     def set(self, key, value):
-        self.cache[key] = (value, time.time())
+        with self.lock:
+            self.cache.pop(key, None)
+            self.cache[key] = (value, time.time())
+            while len(self.cache) > self.max_entries:
+                self.cache.popitem(last=False)
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
 
 search_cache = FastCache(ttl_seconds=30)  # 30 Seconds cache for SQL/Fuzzy searches
 api_movies_cache = FastCache(ttl_seconds=30) # 30 Seconds cache for Web App Home
@@ -1317,8 +1336,14 @@ def _best_local_identity(record):
         record.get("filename_evidence", {}),
         forward_source=record.get("forward_source"),
     )
-    title = merged.get("title") or "Unknown_Movie"
-    year = str(merged.get("year") or "").strip()
+    raw_title = merged.get("title") or "Unknown_Movie"
+    parsed = parse_content_identity(raw_title)
+    title = (
+        parsed.canonical_title
+        if is_safe_canonical_title(parsed.canonical_title)
+        else raw_title
+    )
+    year = str(merged.get("year") or parsed.year or "").strip()
     return title, year, _canonical_evidence_title(title)
 
 
@@ -2218,6 +2243,9 @@ def update_movies_in_db():
         for item in all_items:
             title = item.get('title')
             url = item.get('url')
+            if title and not is_safe_canonical_title(title):
+                logger.warning("Skipping Blogger title with media noise: %r", title)
+                continue
 
             if last_sync_time and 'published' in item:
                 try:
@@ -2373,7 +2401,7 @@ def _get_movies_from_db_nocache(user_query, limit=10):
     try:
         conn = get_db_connection()
         if not conn:
-            return []
+            raise RuntimeError("catalog search connection is unavailable")
 
         cur = conn.cursor()
 
@@ -2467,68 +2495,153 @@ def _get_movies_from_db_nocache(user_query, limit=10):
 
 
 def get_movies_fast_sql(query: str, limit: int = 5):
-    cache_key = f"db_fast_{query}_{limit}"
-    cached = search_cache.get(cache_key)
-    if cached is not None:
-        return cached
-    result = _get_movies_fast_sql_nocache(query, limit)
-    search_cache.set(cache_key, result)
-    return result
+    """Shared, bounded-cache search entry point for all Telegram search routes."""
+    return _get_movies_fast_sql_nocache(query, limit)
+
 
 def _get_movies_fast_sql_nocache(query: str, limit: int = 5):
-    """
-    Smart SQL Search: Fast like SQL + Smart like FuzzyWuzzy.
-    Handles typos using PostgreSQL 'pg_trgm' (Similarity).
-    """
+    """Search exact normalized titles, then prefixes, then fuzzy matches."""
+    total_start = time.perf_counter()
+    cache_start = total_start
+    normalized_query = _normalize_search_text(query)
+    normalization_ms = (time.perf_counter() - cache_start) * 1000
+    if not normalized_query:
+        return []
+    cache_key = ("catalog_search", normalized_query, int(limit))
+    cache_start = time.perf_counter()
+    cached = search_cache.get(cache_key)
+    cache_ms = (time.perf_counter() - cache_start) * 1000
+    if cached is not None:
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Search timing query=%r total_ms=%.2f normalize_ms=%.2f "
+                "cache_ms=%.2f connection_acquire_ms=0 exact_prefix_sql_ms=0 "
+                "fuzzy_title_sql_ms=0 fuzzy_alias_sql_ms=0 python_ms=0 "
+                "fallback_ms=0 "
+                "result=cache",
+                query[:80],
+                (time.perf_counter() - total_start) * 1000,
+                normalization_ms,
+                cache_ms,
+            )
+        return list(cached)
+
     conn = None
+    connection_acquire_ms = 0.0
+    exact_prefix_sql_ms = 0.0
+    fuzzy_title_sql_ms = 0.0
+    fuzzy_alias_sql_ms = 0.0
+    python_start = time.perf_counter()
+    stage = "exact"
     try:
+        acquire_start = time.perf_counter()
         conn = get_db_connection()
+        connection_acquire_ms = (time.perf_counter() - acquire_start) * 1000
         if not conn:
-            return []
+            raise RuntimeError("catalog search connection is unavailable")
 
         cur = conn.cursor()
-        
-        # Keep the common title lookup independent from fuzzy matching. An OR
-        # with SIMILARITY forces PostgreSQL to score every row even when the
-        # indexed ILIKE branch already has an exact/partial match.
-        exact_sql = """
-            SELECT m.id, m.title, m.url, m.file_id, m.imdb_id, m.poster_url, m.year, m.genre,
-                   0.0 as sim_score
+        exact_prefix_sql = """
+            SELECT m.id, m.title, m.url, m.file_id, m.imdb_id, m.poster_url, m.year, m.genre
             FROM movies m
-            WHERE m.title ILIKE %s
-            ORDER BY m.title
+            WHERE regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g') = %s
+               OR regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g') LIKE %s
+            ORDER BY CASE
+                WHEN regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g') = %s
+                THEN 0 ELSE 1
+            END, m.title, m.id
             LIMIT %s
         """
-        cur.execute(exact_sql, (f'%{query}%', limit))
+        exact_start = time.perf_counter()
+        cur.execute(
+            exact_prefix_sql,
+            (normalized_query, normalized_query + "%", normalized_query, limit),
+        )
         results = cur.fetchall()
+        exact_prefix_sql_ms = (time.perf_counter() - exact_start) * 1000
 
         if not results:
-            fuzzy_sql = """
-                SELECT m.id, m.title, m.url, m.file_id, m.imdb_id, m.poster_url, m.year, m.genre,
-                       SIMILARITY(m.title, %s) as sim_score
+            stage = "fuzzy"
+            fuzzy_start = time.perf_counter()
+            cur.execute(
+                """
+                SELECT m.id, m.title, m.url, m.file_id, m.imdb_id, m.poster_url, m.year, m.genre
                 FROM movies m
-                WHERE SIMILARITY(m.title, %s) > 0.3
-                ORDER BY sim_score DESC
+                WHERE SIMILARITY(
+                    regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g'),
+                    %s
+                ) >= 0.30
+                ORDER BY SIMILARITY(
+                    regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g'),
+                    %s
+                ) DESC, m.id
                 LIMIT %s
-            """
-            cur.execute(fuzzy_sql, (query, query, limit))
+                """,
+                (normalized_query, normalized_query, limit),
+            )
             results = cur.fetchall()
-        
-        # Format results (remove score from tuple)
-        final_results = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]) for r in results]
-        
-        cur.close()
-        return final_results
+            fuzzy_title_sql_ms = (time.perf_counter() - fuzzy_start) * 1000
+            if not results:
+                fuzzy_alias_start = time.perf_counter()
+                cur.execute(
+                    """
+                    SELECT DISTINCT m.id, m.title, m.url, m.file_id,
+                                    m.imdb_id, m.poster_url, m.year, m.genre
+                    FROM movies m
+                    JOIN movie_aliases ma ON ma.movie_id = m.id
+                    WHERE SIMILARITY(
+                        regexp_replace(LOWER(ma.alias), '[^a-z0-9]', '', 'g'),
+                        %s
+                    ) >= 0.30
+                    ORDER BY m.title, m.id
+                    LIMIT %s
+                    """,
+                    (normalized_query, limit),
+                )
+                results = cur.fetchall()
+                fuzzy_alias_sql_ms = (
+                    time.perf_counter() - fuzzy_alias_start
+                ) * 1000
 
-    except Exception as e:
-        logger.error(f"Smart SQL Search Error: {e}")
-        return []
+        final_results = tuple(tuple(row[:8]) for row in results)
+        cur.close()
+        search_cache.set(cache_key, final_results)
+        return list(final_results)
+
+    except Exception:
+        logger.exception("Catalog search failed at %s stage", stage)
+        raise
     finally:
         if conn:
             try:
                 close_db_connection(conn)
-            except:
-                pass
+            except Exception:
+                logger.exception("Could not return catalog search connection to pool")
+        if SEARCH_TIMING_ENABLED:
+            python_ms = max(
+                0.0,
+                (time.perf_counter() - python_start) * 1000
+                - connection_acquire_ms
+                - exact_prefix_sql_ms
+                - fuzzy_title_sql_ms
+                - fuzzy_alias_sql_ms,
+            )
+            logger.info(
+                "Search timing query=%r total_ms=%.2f normalize_ms=%.2f "
+            "cache_ms=%.2f connection_acquire_ms=%.2f "
+            "exact_prefix_sql_ms=%.2f fuzzy_title_sql_ms=%.2f "
+                "fuzzy_alias_sql_ms=%.2f python_ms=%.2f fallback_ms=0 result=%s",
+                query[:80],
+                (time.perf_counter() - total_start) * 1000,
+                normalization_ms,
+                cache_ms,
+                connection_acquire_ms,
+                exact_prefix_sql_ms,
+                fuzzy_title_sql_ms,
+                fuzzy_alias_sql_ms,
+                python_ms,
+                stage,
+            )
 
 
 def get_movie_by_imdb_id(imdb_id: str):
@@ -3325,6 +3438,178 @@ def _find_movie_by_provider_identity(cur, imdb_id=None, tmdb_id=None):
             f"tmdb_id={tmdb_id!r}"
         )
     return matches[0][0]
+
+
+def _find_movie_by_canonical_identity(
+    cur, title, year=None, require_series=False, content_type=None
+):
+    """Resolve exact canonical names only when the remaining identity is unique."""
+    conditions = ["LOWER(BTRIM(title)) = LOWER(BTRIM(%s))"]
+    params = [title]
+    if year:
+        conditions.append("year = %s")
+        params.append(int(year))
+    if require_series:
+        conditions.append(
+            "LOWER(COALESCE(content_type, '')) IN "
+            "('web series', 'tv series', 'tv show', 'series', 'anime')"
+        )
+    elif content_type:
+        conditions.append("LOWER(COALESCE(content_type, '')) = LOWER(%s)")
+        params.append(content_type)
+    cur.execute(
+        "SELECT id FROM movies WHERE {} ORDER BY id".format(" AND ".join(conditions)),
+        tuple(params),
+    )
+    rows = cur.fetchall()
+    if len(rows) > 1:
+        return None, True
+    return (rows[0][0], False) if rows else (None, False)
+
+
+def _record_ingestion_evidence(
+    conn,
+    *,
+    file_unique_id,
+    raw_caption,
+    raw_filename,
+    evidence,
+    parsed_identity,
+    provider_ids,
+    movie_id,
+    movie_file_id,
+    resolver_method,
+    confidence,
+    status,
+    warnings=(),
+):
+    """Upsert the latest evidence for a Telegram file without losing its history."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO ingestion_evidence
+            (telegram_file_unique_id, raw_caption, raw_filename, evidence,
+             parsed_identity, provider_ids, resolved_movie_id, movie_file_id,
+             resolver_method, confidence, status, warnings)
+        VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (telegram_file_unique_id) DO UPDATE SET
+            raw_caption = EXCLUDED.raw_caption,
+            raw_filename = EXCLUDED.raw_filename,
+            evidence = EXCLUDED.evidence,
+            parsed_identity = EXCLUDED.parsed_identity,
+            provider_ids = EXCLUDED.provider_ids,
+            resolved_movie_id = EXCLUDED.resolved_movie_id,
+            movie_file_id = EXCLUDED.movie_file_id,
+            resolver_method = EXCLUDED.resolver_method,
+            confidence = EXCLUDED.confidence,
+            status = EXCLUDED.status,
+            warnings = EXCLUDED.warnings,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            file_unique_id,
+            raw_caption or "",
+            raw_filename or "",
+            json.dumps(evidence or {}, ensure_ascii=False),
+            json.dumps(parsed_identity or {}, ensure_ascii=False),
+            json.dumps(provider_ids or {}, ensure_ascii=False),
+            movie_id,
+            movie_file_id,
+            resolver_method or "",
+            max(0.0, min(float(confidence or 0), 1.0)),
+            status,
+            json.dumps(list(warnings or ()), ensure_ascii=False),
+        ),
+    )
+    cur.close()
+
+
+def _record_pending_identity(
+    file_unique_id,
+    raw_caption,
+    raw_filename,
+    evidence,
+    parsed_identity,
+    warning,
+):
+    """Persist identity decisions that are intentionally held before movie creation."""
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Could not persist pending identity: database connection unavailable")
+        return
+    try:
+        _record_ingestion_evidence(
+            conn,
+            file_unique_id=file_unique_id,
+            raw_caption=raw_caption,
+            raw_filename=raw_filename,
+            evidence=evidence,
+            parsed_identity=parsed_identity,
+            provider_ids={},
+            movie_id=None,
+            movie_file_id=None,
+            resolver_method="no_safe_canonical_identity",
+            confidence=0,
+            status="pending_review",
+            warnings=(warning,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Could not persist pending identity evidence")
+    finally:
+        close_db_connection(conn)
+
+
+def _link_movie_file_episodes(conn, movie_file_id, movie_id, parsed_identity):
+    """Create normalized season/episode records and link this file to each episode."""
+    season_number = parsed_identity.get("season_number")
+    episode_numbers = parsed_identity.get("episode_numbers") or ()
+    if season_number is None:
+        return
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO seasons (movie_id, season_number)
+        VALUES (%s, %s)
+        ON CONFLICT (movie_id, season_number)
+        DO UPDATE SET season_number = EXCLUDED.season_number
+        RETURNING id
+        """,
+        (movie_id, int(season_number)),
+    )
+    season_id = cur.fetchone()[0]
+    cur.execute(
+        """
+        INSERT INTO file_seasons (movie_file_id, season_id)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+        """,
+        (movie_file_id, season_id),
+    )
+    for episode_number in episode_numbers:
+        cur.execute(
+            """
+            INSERT INTO episodes (season_id, episode_number)
+            VALUES (%s, %s)
+            ON CONFLICT (season_id, episode_number)
+            DO UPDATE SET episode_number = EXCLUDED.episode_number
+            RETURNING id
+            """,
+            (season_id, int(episode_number)),
+        )
+        episode_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO file_episodes (movie_file_id, episode_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (movie_file_id, episode_id),
+        )
+    conn.commit()
+    cur.close()
 
 
 def fetch_movie_metadata(query: str, search_year: str = "", search_lang: str = "", adult_mode: bool = False, hint_category: str = ""):
@@ -4199,12 +4484,25 @@ def get_movie_delivery_meta(movie_id):
 
 def get_movie_delivery_data(movie_id):
     """Fetch file qualities and rendering metadata in one database round-trip."""
+    total_start = time.perf_counter()
+    acquire_start = total_start
     conn = get_db_connection()
+    acquire_ms = (time.perf_counter() - acquire_start) * 1000
     if not conn:
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Search timing stage=delivery movie_id=%s total_ms=%.2f "
+                "connection_acquire_ms=%.2f sql_ms=0 python_ms=0 result=unavailable",
+                movie_id,
+                (time.perf_counter() - total_start) * 1000,
+                acquire_ms,
+            )
         return [], ("", None)
 
+    sql_ms = 0.0
     try:
         cur = conn.cursor()
+        sql_start = time.perf_counter()
         cur.execute("""
             SELECT m.category, m.poster_url,
                    mf.quality, mf.url, mf.file_id, mf.file_size,
@@ -4223,6 +4521,7 @@ def get_movie_delivery_data(movie_id):
             END DESC
         """, (movie_id,))
         rows = cur.fetchall()
+        sql_ms = (time.perf_counter() - sql_start) * 1000
         cur.close()
 
         if not rows:
@@ -4242,6 +4541,19 @@ def get_movie_delivery_data(movie_id):
     finally:
         if conn:
             close_db_connection(conn)
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Search timing stage=delivery movie_id=%s total_ms=%.2f "
+                "connection_acquire_ms=%.2f sql_ms=%.2f python_ms=%.2f",
+                movie_id,
+                (time.perf_counter() - total_start) * 1000,
+                acquire_ms,
+                sql_ms,
+                max(
+                    0.0,
+                    (time.perf_counter() - total_start) * 1000 - acquire_ms - sql_ms,
+                ),
+            )
 
 
 # create_quality_selection_keyboard function ko isse replace karein ya modify karein:
@@ -4839,22 +5151,14 @@ async def background_search_and_send(update: Update, context: ContextTypes.DEFAU
             try: await status_msg.delete() 
             except: pass
             
-            safe_query = quote(query_text)
-            web_app_url = f"{WEB_APP_URL}?req={safe_query}"
             suggestions = await run_async(get_google_title_suggestions, query_text, limit=3)
-            keyboard_rows = []
-            for title in suggestions:
-                callback_title = quote(title[:35], safe='')
-                if len(f"retrysearch_{callback_title}".encode('utf-8')) <= 64:
-                    keyboard_rows.append([InlineKeyboardButton(f"🔎 Search: {title}", callback_data=f"retrysearch_{callback_title}")])
-            request_title = quote(query_text[:35], safe='')
-            if len(f"request_prefill_{request_title}".encode('utf-8')) <= 64:
-                keyboard_rows.append([InlineKeyboardButton("🙋 Request this title", callback_data=f"request_prefill_{request_title}")])
-            keyboard_rows.append([InlineKeyboardButton("🌐 Open Request Portal", web_app=WebAppInfo(url=web_app_url))])
-            keyboard = InlineKeyboardMarkup(keyboard_rows)
+            keyboard = _not_found_keyboard(query_text, suggestions)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"😕 Sorry, <b>'{query_text}'</b> not found.\n\nस्पेलिंग चेक करने और Request भेजने के लिए नीचे क्लिक करें 👇",
+                text=(
+                    f"😕 Sorry, <b>'{html_escape(query_text)}</b>' not found.\n\n"
+                    "Check the spelling and request the title below."
+                ),
                 reply_markup=keyboard,
                 parse_mode='HTML'
             )
@@ -4889,12 +5193,16 @@ async def background_search_and_send(update: Update, context: ContextTypes.DEFAU
         # Send the movie using your existing helper function
         await send_movie_to_user(update, context, movie_id, title, url, file_id)
 
-    except Exception as e:
-        logger.error(f"Background Search Error: {e}")
-        try: 
-            await status_msg.edit_text("❌ Error fetching movie. Please try again.")
-        except: 
-            pass
+    except Exception:
+        logger.exception("Background search failed")
+        await remove_search_progress(status_msg)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Search is temporarily unavailable. Please try again.",
+            )
+        except Exception:
+            logger.exception("Could not send background-search error response")
 
 # ==================== CLEAN LOADING FUNCTION (FIXED) ====================
 async def deliver_movie_on_start(update: Update, context: ContextTypes.DEFAULT_TYPE, movie_id: int):
@@ -5544,17 +5852,43 @@ async def process_movie_exact_match(
     movie_id: int,
     title: str,
     timing: Optional[dict] = None,
+    status_message=None,
 ):
     delivery_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
+    if status_message:
+        try:
+            await status_message.edit_text(
+                f"✅ Found <b>{html_escape(title)}</b> — loading available files…",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.debug("Could not update search progress before file lookup")
     qualities, (category, poster_url) = await run_async(
         get_movie_delivery_data, movie_id
     )
     if timing is not None and delivery_start is not None:
         timing['delivery_data_ms'] = int((time.perf_counter() - delivery_start) * 1000)
     if not qualities:
-        await update.message.reply_text("No files found!")
+        no_files_text = f"❌ No files found for <b>{html_escape(title)}</b>."
+        if status_message:
+            try:
+                response_start = time.perf_counter()
+                await status_message.edit_text(no_files_text, parse_mode="HTML")
+                if SEARCH_TIMING_ENABLED:
+                    logger.info(
+                        "Search timing stage=result_response movie_id=%s "
+                        "telegram_ms=%.2f result=no_files",
+                        movie_id,
+                        (time.perf_counter() - response_start) * 1000,
+                    )
+            except Exception:
+                logger.exception("Could not update empty search result state")
+                await update.message.reply_text(no_files_text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(no_files_text, parse_mode="HTML")
         return
 
+    format_start = time.perf_counter()
     context.user_data['selected_movie_data'] = {
         'id': movie_id,
         'title': title,
@@ -5563,8 +5897,11 @@ async def process_movie_exact_match(
     }
 
     bot_info = context.bot
+    get_me_ms = 0.0
     if not bot_info.username:
+        get_me_start = time.perf_counter()
         bot_info = await context.bot.get_me()
+        get_me_ms = (time.perf_counter() - get_me_start) * 1000
     bot_username = bot_info.username
     file_list_text = _format_requested_files_header(
         title,
@@ -5595,43 +5932,49 @@ async def process_movie_exact_match(
         total_pages=total_pages, 
         current_files=current_files
     )
+    format_ms = (time.perf_counter() - format_start) * 1000 - get_me_ms
+    if SEARCH_TIMING_ENABLED:
+        logger.info(
+            "Search timing stage=result_format movie_id=%s format_ms=%.2f "
+            "telegram_get_me_ms=%.2f file_count=%d",
+            movie_id,
+            max(0.0, format_ms),
+            get_me_ms,
+            len(qualities),
+        )
     
-    if poster_url:
+    response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
+    if status_message:
         try:
-            poster_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
-            processed_poster = await make_landscape_poster(poster_url)
-            if timing is not None and poster_start is not None:
-                timing['poster_ms'] = int((time.perf_counter() - poster_start) * 1000)
-            response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
-            msg = await update.message.reply_photo(
-                photo=processed_poster,
-                caption=file_list_text,
+            msg = await status_message.edit_text(
+                file_list_text,
                 reply_markup=keyboard_markup,
-                parse_mode='HTML'
+                parse_mode='HTML',
+                disable_web_page_preview=True,
             )
-            if timing is not None and response_start is not None:
-                timing['telegram_response_ms'] = int((time.perf_counter() - response_start) * 1000)
-        except Exception as e:
-            logger.error(f"Failed to send photo: {e}")
-            response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
+        except Exception:
+            logger.exception("Could not replace search progress with movie files")
             msg = await update.message.reply_text(
                 file_list_text,
                 reply_markup=keyboard_markup,
                 parse_mode='HTML',
-                disable_web_page_preview=True
+                disable_web_page_preview=True,
             )
-            if timing is not None and response_start is not None:
-                timing['telegram_response_ms'] = int((time.perf_counter() - response_start) * 1000)
     else:
-        response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
         msg = await update.message.reply_text(
             file_list_text,
             reply_markup=keyboard_markup,
             parse_mode='HTML',
             disable_web_page_preview=True
         )
-        if timing is not None and response_start is not None:
-            timing['telegram_response_ms'] = int((time.perf_counter() - response_start) * 1000)
+    if timing is not None and response_start is not None:
+        timing['response_ms'] = int((time.perf_counter() - response_start) * 1000)
+    if SEARCH_TIMING_ENABLED and response_start is not None:
+        logger.info(
+            "Search timing stage=result_response movie_id=%s telegram_edit_ms=%.2f",
+            movie_id,
+            (time.perf_counter() - response_start) * 1000,
+        )
     track_message_for_deletion(
         context, update.effective_chat.id, msg.message_id, USER_TEXT_DELETE_SECONDS
     )
@@ -5658,6 +6001,20 @@ async def send_search_progress(update: Update, context: ContextTypes.DEFAULT_TYP
         return None
 
 
+async def _update_search_progress(progress_message, source_message, text, **kwargs):
+    """Replace a temporary search status, with a reply fallback if editing fails."""
+    if progress_message:
+        try:
+            return await progress_message.edit_text(text, **kwargs)
+        except Exception:
+            logger.info("Could not edit search progress; sending result as a reply")
+            try:
+                await progress_message.delete()
+            except Exception:
+                logger.debug("Could not remove stale search progress")
+    return await source_message.reply_text(text, **kwargs)
+
+
 async def remove_search_progress(progress_message):
     if not progress_message:
         return
@@ -5667,8 +6024,119 @@ async def remove_search_progress(progress_message):
         logger.debug(f"Search progress message could not be deleted: {exc}")
 
 
+def _request_portal_url(title=""):
+    """Return a usable HTTPS Mini App URL, falling back if configuration is invalid."""
+    fallback = "https://flimfybox-bot-yht0.onrender.com/webapp"
+    try:
+        parsed = urlparse(WEB_APP_URL or "")
+        is_configured_portal = (
+            parsed.scheme.casefold() == "https"
+            and bool(parsed.netloc)
+            and parsed.path.rstrip("/") == "/webapp"
+        )
+    except ValueError:
+        is_configured_portal = False
+        parsed = urlparse(fallback)
+    if not is_configured_portal:
+        parsed = urlparse(fallback)
+    base_url = urlunparse(parsed._replace(query="", fragment=""))
+    query_string = urlencode({"req": str(title or "")[:200]}) if title else ""
+    return "{}?{}".format(base_url, query_string) if query_string else base_url
+
+
+def _not_found_keyboard(query_text, suggestions=()):
+    """Build only buttons with valid callback sizes and usable HTTPS destinations."""
+    rows = []
+    for title in suggestions:
+        encoded_title = quote(str(title), safe="")
+        callback_data = "retrysearch_" + encoded_title
+        if len(callback_data.encode("utf-8")) <= 64:
+            display_title = str(title)
+            if len(display_title) > 56:
+                display_title = display_title[:53] + "..."
+            rows.append([
+                InlineKeyboardButton(
+                    "🔎 Search: {}".format(display_title),
+                    callback_data=callback_data,
+                )
+            ])
+
+    encoded_request = quote(str(query_text or ""), safe="")
+    request_callback = "request_prefill_" + encoded_request
+    if query_text and len(request_callback.encode("utf-8")) <= 64:
+        rows.append([
+            InlineKeyboardButton(
+                "🙋 Request this title",
+                callback_data=request_callback,
+            )
+        ])
+
+    portal_url = _request_portal_url(query_text)
+    if is_valid_url(portal_url) and urlparse(portal_url).scheme.casefold() == "https":
+        rows.append([
+            InlineKeyboardButton("🌐 Open Request Portal", url=portal_url)
+        ])
+
+    if (
+        is_valid_url(UPDATE_CHANNEL_URL)
+        and urlparse(UPDATE_CHANNEL_URL).scheme.casefold() == "https"
+    ):
+        rows.append([
+            InlineKeyboardButton(
+                "📢 Update Channel: Join BackUp",
+                url=UPDATE_CHANNEL_URL,
+            )
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _replace_search_result_message(
+    query,
+    context,
+    text,
+    reply_markup=None,
+    parse_mode="HTML",
+    disable_web_page_preview=True,
+):
+    """Edit text/caption when supported; otherwise send a replacement message."""
+    message = getattr(query, "message", None)
+    if message:
+        has_caption = any(
+            getattr(message, attribute, None)
+            for attribute in ("animation", "photo", "video", "document", "audio", "voice")
+        )
+        try:
+            if has_caption:
+                return await query.edit_message_caption(
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+            return await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        except Exception as exc:
+            logger.info("Could not edit search result message; sending a replacement: %s", exc)
+
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(query, "chat_id", None)
+    if chat_id is None:
+        raise ValueError("Search result callback has no target chat")
+    return await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        disable_web_page_preview=disable_web_page_preview,
+    )
+
+
 async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for movies in the database"""
+    handler_entry = time.perf_counter()
     progress_message = None
     try:
         # Agar ye button click se aya hai (cancel/back)
@@ -5696,8 +6164,11 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Lightweight timing instrumentation for debug (disabled by default)
         times = {}
         if SEARCH_TIMING_ENABLED:
-            times['handler_start'] = time.perf_counter()
-            logger.info("Search timing stage=handler_started")
+            times['handler_start'] = handler_entry
+            logger.info(
+                "Search timing stage=handler_entry query=%r",
+                search_term[:80],
+            )
 
         progress_message = context.user_data.pop('_search_progress_message', None)
         if progress_message is None:
@@ -5719,12 +6190,6 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         movies = await run_async(get_movies_fast_sql, search_term, limit=10)
         if SEARCH_TIMING_ENABLED:
             times['first_db'] = time.perf_counter()
-        if not movies:
-            if SEARCH_TIMING_ENABLED:
-                times['fuzzy_db_start'] = time.perf_counter()
-            movies = await run_async(get_movies_from_db, search_term, limit=10)
-            if SEARCH_TIMING_ENABLED:
-                times['fuzzy_db_end'] = time.perf_counter()
         
         # 2. Not Found
         if not movies:
@@ -5738,42 +6203,19 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if SEARCH_TIMING_ENABLED:
                 times['google_end'] = time.perf_counter()
 
+            result_format_start = time.perf_counter()
+            keyboard = _not_found_keyboard(query, suggestions)
             not_found_text = (
-                "<b>━━━━ ❌ 𝗡𝗼𝘁 𝗙𝗼𝘂𝗻𝗱 ━━━━</b>\n\n"
-                "✦ माफ़ करें, मुझे कोई मिलती-जुलती फ़िल्म नहीं मिली\n\n"
-                "◈ <b><a href='https://www.google.com/'>𝗚𝗼𝗼𝗴𝗹𝗲</a></b> ☜ सर्च करें..!!\n\n"
-                "◈ मूवी की स्पेलिंग गूगल पर सर्च करके, कॉपी करे, उसके बाद यहां टाइप करें।✔️\n\n"
-                "◈ बस मूवी का नाम + वर्ष लिखें, उसके आगे पीछे कुछ भी ना लिखे..।♻️\n\n"
-                "<b>⟐ 𝗘𝘅𝗮𝗺𝗽𝗹𝗲</b>\n\n"
-                "╭──── सही है.!‼️ ────╮\n"
-                "│\n"
-                "│  𝑲𝒈𝒇 𝟐 ✔️  ❙  𝑲𝒈𝒇 𝟐 𝑴𝒐𝒗𝒊𝒆 ❌\n"
-                "│  𝑨𝒔𝒖𝒓 𝑺𝟎𝟏 𝑬𝟎𝟑 ✔️  ❙  𝑨𝒔𝒖𝒓 𝑺𝒆𝒂𝒔𝒐𝒏𝟑 ❌\n"
-                "│\n"
-                "╰────────────────────╯\n\n"
-                "👇 <b>सही स्पेलिंग ढूँढने और Request करने के लिए नीचे क्लिक करें:</b>"
+                "<b>❌ No matching title found</b>\n\n"
+                "Check the spelling or add the release year. "
+                "You can retry a suggestion or request this title below."
             )
+            if SEARCH_TIMING_ENABLED:
+                times['result_format_ms'] = (
+                    time.perf_counter() - result_format_start
+                ) * 1000
 
-            # 🌐 NAYA JUGAD: Web App URL jisme user ki galat spelling (query) attach hogi
-            safe_query = quote(query)
-            web_app_url = f"{WEB_APP_URL}?req={safe_query}"
-
-            keyboard_rows = []
-            for title in suggestions:
-                callback_title = quote(title[:35], safe='')
-                # Telegram callback_data is capped at 64 bytes.
-                if len(f"retrysearch_{callback_title}".encode('utf-8')) <= 64:
-                    keyboard_rows.append([InlineKeyboardButton(f"🔎 Search: {title}", callback_data=f"retrysearch_{callback_title}")])
-            # This lets a user request the typed title without opening the mini app.
-            request_title = quote(query[:35], safe='')
-            if len(f"request_prefill_{request_title}".encode('utf-8')) <= 64:
-                keyboard_rows.append([InlineKeyboardButton("🙋 Request this title", callback_data=f"request_prefill_{request_title}")])
-            keyboard_rows.extend([
-                [InlineKeyboardButton("🌐 Open Request Portal", web_app=WebAppInfo(url=web_app_url))],
-                [InlineKeyboardButton("📢 Update Channel: Join BackUp", url=UPDATE_CHANNEL_URL)]
-            ])
-            keyboard = InlineKeyboardMarkup(keyboard_rows)
-
+            response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
             msg = None
             if SEARCH_ERROR_GIFS:
                 try:
@@ -5796,10 +6238,19 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             # Auto Delete Not Found Msg
             track_user_message_for_deletion(context, update.effective_chat.id, msg)
+            if SEARCH_TIMING_ENABLED and response_start is not None:
+                times['response_ms'] = int(
+                    (time.perf_counter() - response_start) * 1000
+                )
             return # <--- YAHAN SE MAIN_MENU HATA DIYA HAI
 
         # 3. Found
+        selection_start = time.perf_counter()
         chosen_movie = _select_single_search_result(query, movies)
+        if SEARCH_TIMING_ENABLED:
+            times['result_format_ms'] = (
+                time.perf_counter() - selection_start
+            ) * 1000
         
         if chosen_movie:
             movie_id, title, url, file_id = chosen_movie[:4]
@@ -5814,30 +6265,54 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if SEARCH_TIMING_ENABLED:
                 times['exact_match_decision'] = time.perf_counter()
             await process_movie_exact_match(
-                update, context, movie_id, title, timing=times
+                update,
+                context,
+                movie_id,
+                title,
+                timing=times,
+                status_message=progress_message,
             )
+            progress_message = None
             return
 
+        result_format_start = time.perf_counter()
         context.user_data['search_results'] = movies
         context.user_data['search_query'] = query
 
         keyboard = create_movie_selection_keyboard(movies, page=0)
-        
-        msg = await update.message.reply_text(
+        result_text = (
             f"<b>━━━━━━ 🎬 𝗦𝗲𝗮𝗿𝗰𝗵 𝗥𝗲𝘀𝘂𝗹𝘁𝘀 ━━━━━━</b>\n\n"
             f"✦ 𝗙𝗼𝘂𝗻𝗱 <b>{len(movies)}</b> results for '<b>{query}</b>'\n\n"
-            f"👇 <b>𝗦𝗲𝗹𝗲𝗰𝘁 𝘆𝗼𝘂𝗿 𝗺𝗼𝘃𝗶𝗲 𝗯𝗲𝗹𝗼𝘄:</b>",
+            f"👇 <b>𝗦𝗲𝗹𝗲𝗰𝘁 𝘆𝗼𝘂𝗿 𝗺𝗼𝘃𝗶𝗲 𝗯𝗲𝗹𝗼𝘄:</b>"
+        )
+        if SEARCH_TIMING_ENABLED:
+            times['result_format_ms'] = (
+                time.perf_counter() - result_format_start
+            ) * 1000
+            response_start = time.perf_counter()
+        msg = await update.message.reply_text(
+            result_text,
             reply_markup=keyboard,
             parse_mode='HTML'
         )
+        if SEARCH_TIMING_ENABLED:
+            times['response_ms'] = (
+                time.perf_counter() - response_start
+            ) * 1000
         
         track_message_for_deletion(context, update.effective_chat.id, msg.message_id, USER_TEXT_DELETE_SECONDS)
         return # <--- YAHAN SE BHI MAIN_MENU HATA DIYA HAI
 
-    except Exception as e:
+    except Exception:
         await remove_search_progress(progress_message)
-        logger.error(f"Error in search_movies: {e}")
-        # await update.message.reply_text("An error occurred during search.") <--- ERROR MSG HATA DIYA TAKI USER DISTURB NA HO
+        logger.exception("Error in search_movies")
+        if update.message:
+            try:
+                await update.message.reply_text(
+                    "⚠️ Search is temporarily unavailable. Please try again."
+                )
+            except Exception:
+                logger.exception("Could not send private-search error response")
         return
     finally:
         # The temporary loading GIF must never remain after the search finishes.
@@ -5853,8 +6328,14 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     deltas['to_progress_ms'] = int((times.get('progress_sent') - handler_start) * 1000)
                 if times.get('before_first_db') and times.get('first_db'):
                     deltas['first_db_ms'] = int((times.get('first_db') - times.get('before_first_db')) * 1000)
-                if times.get('fuzzy_db_start') and times.get('fuzzy_db_end'):
-                    deltas['fuzzy_db_ms'] = int((times.get('fuzzy_db_end') - times.get('fuzzy_db_start')) * 1000)
+                if times.get('google_start') and times.get('google_end'):
+                    deltas['fallback_ms'] = int((times.get('google_end') - times.get('google_start')) * 1000)
+                if times.get('response_ms'):
+                    deltas['response_ms'] = times['response_ms']
+                if times.get('result_format_ms') is not None:
+                    deltas['result_format_ms'] = round(
+                        times['result_format_ms'], 2
+                    )
                 if times.get('google_start') and times.get('google_end'):
                     deltas['google_ms'] = int((times.get('google_end') - times.get('google_start')) * 1000)
                 if times.get('exact_match_decision'):
@@ -5863,7 +6344,11 @@ async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 timing_data = {
                     key: value for key, value in times.items()
-                    if key in ('delivery_data_ms', 'poster_ms', 'telegram_response_ms')
+                    if key in (
+                        'delivery_data_ms',
+                        'poster_ms',
+                        'telegram_response_ms',
+                    )
                 }
                 deltas.update(timing_data)
                 # Truncate query for privacy in logs
@@ -5994,80 +6479,87 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Server-side spelling suggestions shown after a failed Telegram search.
     # Re-run the normal DB fuzzy search with the suggested, corrected title.
     if data.startswith("retrysearch_"):
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            logger.exception("Could not acknowledge retry-search callback")
         suggested_title = unquote(data[len("retrysearch_"):]).strip()
-        if not suggested_title:
-            return
-        movies = await run_async(get_movies_from_db, suggested_title, limit=10)
-        if not movies:
-            request_title = quote(suggested_title[:35], safe='')
-            keyboard_rows = []
-            if len(f"request_prefill_{request_title}".encode('utf-8')) <= 64:
-                keyboard_rows.append([
-                    InlineKeyboardButton(
-                        "🙋 Request this title",
-                        callback_data=f"request_prefill_{request_title}",
-                    )
-                ])
-            keyboard_rows.append([
-                InlineKeyboardButton("🌐 Open Request Portal", web_app=WebAppInfo(url=WEB_APP_URL))
-            ])
-            await query.edit_message_text(
-                f"❌ <b>{html_escape(suggested_title)}</b> अभी database में available नहीं है।\n\n"
-                "आप चाहें तो इसी title को request कर सकते हैं:",
-                reply_markup=InlineKeyboardMarkup(keyboard_rows),
-                parse_mode='HTML',
-                disable_web_page_preview=True,
-            )
-            return
+        try:
+            if not suggested_title:
+                await _replace_search_result_message(
+                    query, context, "⚠️ Search suggestion was empty. Please search again."
+                )
+                return
+            movies = await run_async(get_movies_fast_sql, suggested_title, limit=10)
+            if not movies:
+                movies = await run_async(get_movies_from_db, suggested_title, limit=10)
+            if not movies:
+                suggestions = await get_google_title_suggestions_with_timeout(
+                    suggested_title, limit=3
+                )
+                await _replace_search_result_message(
+                    query,
+                    context,
+                    (
+                        f"❌ <b>{html_escape(suggested_title)}</b> अभी database में available नहीं है.\n\n"
+                        "Try another suggestion or request this title."
+                    ),
+                    reply_markup=_not_found_keyboard(suggested_title, suggestions),
+                )
+                return
 
-        # A correction button (for example "Dhurandhar") is already the
-        # user's final choice.  When it resolves to one exact local title,
-        # open that title's files immediately instead of making the user click
-        # the same title a second time in a selection list.
-        chosen_movie = _select_single_search_result(suggested_title, movies)
-        if chosen_movie:
-            movie_id, title, url, file_id = chosen_movie[:4]
+            chosen_movie = _select_single_search_result(suggested_title, movies)
+            if chosen_movie:
+                movie_id, title, url, file_id = chosen_movie[:4]
+                await _replace_search_result_message(
+                    query,
+                    context,
+                    f"🔎 <b>{html_escape(title)}</b> found — getting its files…",
+                )
+                await send_movie_to_user(update, context, movie_id, title, url, file_id)
+                return
+
+            context.user_data['search_results'] = movies
+            context.user_data['search_query'] = suggested_title
+            await _replace_search_result_message(
+                query,
+                context,
+                (
+                    f"<b>🎬 Search results</b>\n\n"
+                    f"Found <b>{len(movies)}</b> results for "
+                    f"'<b>{html_escape(suggested_title)}</b>'.\n"
+                    "Select the correct title below:"
+                ),
+                reply_markup=create_movie_selection_keyboard(movies, page=0),
+            )
+        except Exception:
+            logger.exception("Retry search failed for callback")
             try:
-                await query.edit_message_text(
-                    f"🔎 <b>{title}</b> मिल गई — नीचे files चुनें 👇",
-                    parse_mode='HTML'
+                await _replace_search_result_message(
+                    query,
+                    context,
+                    "⚠️ Search is temporarily unavailable. Please try again.",
                 )
             except Exception:
-                pass
-            await send_movie_to_user(update, context, movie_id, title, url, file_id)
-            return
-
-        context.user_data['search_results'] = movies
-        context.user_data['search_query'] = suggested_title
-        await query.edit_message_text(
-            f"<b>━━━━━━ 🎬 𝗦𝗲𝗮𝗿𝗰𝗵 𝗥𝗲𝘀𝘂𝗹𝘁𝘀 ━━━━━━</b>\n\n"
-            f"✦ Found <b>{len(movies)}</b> results for '<b>{suggested_title}</b>'\n\n"
-            "👇 <b>Select your movie below:</b>",
-            reply_markup=create_movie_selection_keyboard(movies, page=0),
-            parse_mode='HTML'
-        )
+                logger.exception("Could not show retry-search error state")
         return
 
-    # ✅ IMPROVED: Group Authorization Check using callback_data embedded user_id
-    # Agar callback_data me _u{user_id} suffix hai, to check karo ki click karne wala wahi user hai
-    if chat_id < 0 and "_u" in data:
-        # Extract requester user_id from callback_data (e.g., movie_123_u987654321)
-        try:
-            u_part = data.split("_u")[-1]  # "987654321"
-            original_user_id = int(u_part)
-            if user_id != original_user_id:
-                user_name = query.from_user.first_name
-                alert_text = (
-                    f"✋ 𝗛𝗲𝗹𝗹𝗼 {user_name}!\n\n"
-                    f"🚫 𝗧𝗵𝗶𝘀 𝗶𝘀 𝗡𝗢𝗧 𝘆𝗼𝘂𝗿 𝗺𝗼𝘃𝗶𝗲 𝗿𝗲𝗾𝘂𝗲𝘀𝘁.\n"
-                    f"🔍 𝗣𝗹𝗲𝗮𝘀𝗲 𝗿𝗲𝗾𝘂𝗲𝘀𝘁 𝘆𝗼𝘂𝗿'𝘀...\n\n"
-                    f"👍 𝗢𝗞"
-                )
-                await query.answer(alert_text, show_alert=True)
-                return
-        except (ValueError, IndexError):
-            pass  # Agar parsing fail ho to ignore karo
+    if chat_id < 0 and data.startswith(("movie_", "page_", "cancel_selection")):
+        requester_match = re.search(r"_u(\d+)$", data)
+        if not requester_match:
+            await query.answer(
+                "This search result is no longer available. Please search again.",
+                show_alert=True,
+            )
+            return
+        if user_id != int(requester_match.group(1)):
+            user_name = query.from_user.first_name
+            alert_text = (
+                f"✋ Hello {user_name}!\n\n"
+                "This is not your search result. Please run your own search."
+            )
+            await query.answer(alert_text, show_alert=True)
+            return
 
 
     # ✅ NAYA: Video wala Pages Button Popup
@@ -7845,54 +8337,51 @@ def auto_upgrade_delete(movie_id, new_quality_label, new_extra_info, conn):
 
 
 def upsert_movie_file(conn, movie_id, label, file_size_str, main_url, backup_map_json, f_lang, f_extra, file_unique_id):
-    """
-    Bulletproof UPSERT for movie_files table.
-    Works regardless of which constraints exist in the DB:
-    - Old: UNIQUE (movie_id, quality) 
-    - New: UNIQUE (file_unique_id)
-    - Both at same time
-    
-    Strategy: Try INSERT → catch any constraint violation → UPDATE by file_unique_id
-    """
+    """Idempotently upsert a Telegram file without ever changing its parent movie."""
     cur = conn.cursor()
     try:
-        cur.execute("""
-            INSERT INTO movie_files (movie_id, quality, file_size, url, backup_map, languages, extra_info, file_unique_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (movie_id, label, file_size_str, main_url, backup_map_json, f_lang, f_extra, file_unique_id))
+        if file_unique_id:
+            cur.execute(
+                """
+                INSERT INTO movie_files
+                    (movie_id, quality, file_size, url, backup_map, languages, extra_info, file_unique_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (file_unique_id) DO UPDATE SET
+                    quality = EXCLUDED.quality,
+                    file_id = NULL,
+                    file_size = EXCLUDED.file_size,
+                    url = EXCLUDED.url,
+                    backup_map = EXCLUDED.backup_map,
+                    languages = EXCLUDED.languages,
+                    extra_info = EXCLUDED.extra_info
+                WHERE movie_files.movie_id = EXCLUDED.movie_id
+                RETURNING id
+                """,
+                (movie_id, label, file_size_str, main_url, backup_map_json, f_lang, f_extra, file_unique_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(
+                    "Telegram file identity is already attached to a different movie"
+                )
+        else:
+            cur.execute(
+                """
+                INSERT INTO movie_files
+                    (movie_id, quality, file_size, url, backup_map, languages, extra_info, file_unique_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
+                RETURNING id
+                """,
+                (movie_id, label, file_size_str, main_url, backup_map_json, f_lang, f_extra),
+            )
+            row = cur.fetchone()
         conn.commit()
-        cur.close()
-        return True  # Fresh insert
-    except Exception as insert_err:
+        return row[0]
+    except Exception:
         conn.rollback()
-        # Constraint violation — update the existing row instead
-        try:
-            cur2 = conn.cursor()
-            cur2.execute("""
-                UPDATE movie_files 
-                SET quality = %s, file_size = %s, url = %s, backup_map = %s, 
-                    file_id = NULL, languages = %s, extra_info = %s
-                WHERE file_unique_id = %s
-            """, (label, file_size_str, main_url, backup_map_json, f_lang, f_extra, file_unique_id))
-            
-            if cur2.rowcount == 0:
-                # file_unique_id doesn't exist yet but (movie_id, quality) does
-                # This means a DIFFERENT file has the same quality → just update that row
-                cur2.execute("""
-                    UPDATE movie_files 
-                    SET file_size = %s, url = %s, backup_map = %s, 
-                        file_id = NULL, languages = %s, extra_info = %s, file_unique_id = %s
-                    WHERE movie_id = %s AND quality = %s
-                """, (file_size_str, main_url, backup_map_json, f_lang, f_extra, file_unique_id, movie_id, label))
-            
-            conn.commit()
-            cur2.close()
-            logger.info(f"🔄 upsert_movie_file: Updated existing row for '{label}' (file_unique_id={file_unique_id})")
-            return True  # Updated
-        except Exception as update_err:
-            conn.rollback()
-            logger.error(f"❌ upsert_movie_file FAILED: insert_err={insert_err}, update_err={update_err}")
-            raise update_err
+        raise
+    finally:
+        cur.close()
 
 
 def generate_quality_label(file_name, file_size_str="", ai_language=""):
@@ -7995,6 +8484,11 @@ async def batch_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         title, year, poster, genre, imdb_id_f, rating, plot, category, seasons_data = data
+        if not is_safe_canonical_title(title):
+            await status_msg.edit_text(
+                "❌ Provider returned an invalid content title; no movie row was created."
+            )
+            return
         seasons_data = normalize_seasons_data(seasons_data)
         tmdb_id = await run_async(
             resolve_tmdb_id_from_imdb, imdb_id_f, category
@@ -8063,7 +8557,12 @@ async def batch_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BATCH_SESSION.update({
             'active': True, 'movie_id': movie_id, 'movie_title': title, 
             'file_count': file_count, 'admin_id': update.effective_user.id, 
-            'language': 'Hindi', 'category': category
+            'language': 'Hindi', 'category': category,
+            'parsed_identity': {},
+            'resolver_method': 'provider_identity',
+            'confidence': 1,
+            'imdb_id': imdb_id_f,
+            'tmdb_id': tmdb_id,
         })
 
         # 5. Success Message with Details
@@ -8120,6 +8619,11 @@ async def batch_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [p.strip() for p in raw_text.split(',')]
     
     title = parts[0] if len(parts) > 0 else "Unknown Title"
+    if not is_safe_canonical_title(title):
+        await update.message.reply_text(
+            "❌ Use a canonical movie/series title without episode or release metadata."
+        )
+        return
     year = parts[1] if len(parts) > 1 else ""
     language = parts[2] if len(parts) > 2 else "Hindi"
     genre = parts[3] if len(parts) > 3 else "Adult, Drama"
@@ -8200,7 +8704,12 @@ async def batch_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'file_count': 0,
             'admin_id': user_id,
             'language': language,
-            'category': category
+            'category': category,
+            'parsed_identity': {},
+            'resolver_method': 'manual_admin_title',
+            'confidence': 1,
+            'imdb_id': imdb_id,
+            'tmdb_id': tmdb_id,
         })
 
         # Show cast in confirmation message (if any)
@@ -8383,6 +8892,9 @@ async def superbatch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 representative.get('caption') or representative.get('file_name') or display_name,
                 image_bytes,
                 reconciled_data=reconciled_data,
+                raw_caption=representative.get('caption', ''),
+                raw_filename=representative.get('file_name', ''),
+                file_unique_id=representative.get('file_unique_id'),
             )
 
             if not result:
@@ -8410,6 +8922,11 @@ async def superbatch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'year':        str(year) if year else '',
                 'category':    category,
                 'language':    movie_lang,
+                'parsed_identity': result.get('parsed_identity', {}),
+                'resolver_method': result.get('resolver_method', ''),
+                'confidence': result.get('confidence', 0),
+                'imdb_id': result.get('imdb_id'),
+                'tmdb_id': result.get('tmdb_id'),
             })
 
             # ── STEP 3: Har file ke liye unified Phase 2 saver ───────────────
@@ -8599,7 +9116,14 @@ async def superbatch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #         → DB INSERT  (pm_file_listener wala COMPLETE ON CONFLICT logic)
 #         → Returns dict with movie_id aur saari details
 # ==============================================================================
-async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconciled_data: dict = None) -> dict:
+async def _core_movie_processor(
+    raw_text: str,
+    image_bytes: Optional[bytes] = None,
+    reconciled_data: Optional[dict] = None,
+    raw_caption: str = "",
+    raw_filename: str = "",
+    file_unique_id: Optional[str] = None,
+) -> Optional[dict]:
     """
     Ek jagah se sab kuch. Returns movie dict ya None agar fail ho.
     """
@@ -8609,14 +9133,33 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
     else:
         ai_data = await get_movie_name_from_caption(raw_text, image_bytes)
         
-    movie_name = ai_data.get("title", "UNKNOWN")
-    movie_year = ai_data.get("year", "")
+    source, parsed_identity, identity_error = resolve_raw_content_identity(
+        raw_caption, raw_filename, raw_text
+    )
+    if not parsed_identity:
+        logger.warning("Ingestion held: no safe canonical title in supplied evidence")
+        _record_pending_identity(
+            file_unique_id,
+            raw_caption or raw_text,
+            raw_filename,
+            ai_data,
+            asdict(parse_content_identity(raw_caption or raw_filename or raw_text)),
+            identity_error or "No plausible canonical content title was found",
+        )
+        return None
+
+    movie_name = parsed_identity.canonical_title
+    movie_year = ai_data.get("year", "") or parsed_identity.year or ""
+    if not str(movie_year).isdigit():
+        movie_year = parsed_identity.year or ""
     movie_lang = ai_data.get("language", "")
     extra_info = ai_data.get("extra_info", "")
     gemini_category = ai_data.get("category", "")
-
-    if movie_name == "UNKNOWN" or len(movie_name) < 2:
+    if not is_safe_canonical_title(movie_name):
         return None
+
+    if parsed_identity.has_episode_marker or parsed_identity.season_number is not None:
+        extra_info = ""
 
     # --- STEP 2: TMDB + IMDb METADATA ---
     metadata = await run_async(fetch_movie_metadata, movie_name, movie_year, movie_lang, False, gemini_category)
@@ -8632,11 +9175,39 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
         plot       = "Auto Added"
         category   = gemini_category if gemini_category else "Movies"
 
+    if not is_safe_canonical_title(title):
+        logger.warning("Ingestion held: metadata returned unsafe canonical title %r", title)
+        _record_pending_identity(
+            file_unique_id,
+            raw_caption or raw_text,
+            raw_filename,
+            ai_data,
+            asdict(parsed_identity),
+            "Provider metadata returned an unsafe title",
+        )
+        return None
+    is_episode = parsed_identity.has_episode_marker or parsed_identity.season_number is not None
+    if is_episode:
+        provider_title = parse_content_identity(title).canonical_title
+        if provider_title.casefold() != movie_name.casefold():
+            _record_pending_identity(
+                file_unique_id,
+                raw_caption or raw_text,
+                raw_filename,
+                ai_data,
+                asdict(parsed_identity),
+                "Provider title does not confirm the raw episode's canonical series",
+            )
+            return None
+        title = movie_name
+
     # 👇 NAYA LOGIC: Gemini Category Priority for Anime 👇
     cat_lower = str(gemini_category or "").lower()
     genre_lower = str(genre or "").lower()
     if "anime" in cat_lower or "cartoon" in cat_lower or "animation" in cat_lower or "anime" in genre_lower or "animation" in genre_lower:
         category = "Anime"
+    if parsed_identity.has_episode_marker or parsed_identity.season_number is not None:
+        category = "Anime" if "anime" in str(gemini_category).casefold() else "Web Series"
     category, content_type = normalize_catalog_labels(
         category=category,
         language=movie_lang,
@@ -8644,28 +9215,6 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
         genre=genre,
         title=title,
     )
-
-    # --- STEP 3: IMDb CAST ---
-    cast_str = ""
-    if imdb_id:
-        cast_str = await run_async(fetch_cast_from_imdb, imdb_id, 5)
-    trailer_key = await run_async(
-        resolve_trailer_key,
-        title,
-        year,
-        imdb_id,
-        category,
-        movie_name,
-    )
-    artwork_poster_url, backdrop_poster_url = await run_async(
-        fetch_tmdb_artwork,
-        title,
-        year,
-        imdb_id,
-        category,
-    )
-    if artwork_poster_url and not poster_url:
-        poster_url = artwork_poster_url
 
     # --- STEP 4: DB INSERT (pm_file_listener ka EXACT ON CONFLICT logic) ---
     if not imdb_id:  # Fix for empty string violating unique constraint
@@ -8680,7 +9229,193 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
 
     try:
         cur = conn.cursor()
-        existing_id = _find_movie_by_provider_identity(cur, imdb_id, tmdb_id)
+        try:
+            existing_id = _find_movie_by_provider_identity(cur, imdb_id, tmdb_id)
+        except ValueError as exc:
+            _record_ingestion_evidence(
+                conn,
+                file_unique_id=file_unique_id,
+                raw_caption=raw_caption or raw_text,
+                raw_filename=raw_filename,
+                evidence=ai_data,
+                parsed_identity=asdict(parsed_identity),
+                provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                movie_id=None,
+                movie_file_id=None,
+                resolver_method="conflicting_provider_identity",
+                confidence=parsed_identity.confidence,
+                status="pending_review",
+                warnings=parsed_identity.parse_warnings + (str(exc),),
+            )
+            conn.commit()
+            cur.close()
+            return None
+        resolver_method = "provider_identity" if existing_id else "provider_metadata"
+        ambiguous = False
+        identity_conflict = False
+        if existing_id and is_episode:
+            cur.execute(
+                "SELECT title, content_type FROM movies WHERE id = %s",
+                (existing_id,),
+            )
+            provider_parent = cur.fetchone()
+            series_types = {"web series", "tv series", "tv show", "series", "anime"}
+            identity_conflict = bool(
+                not provider_parent
+                or provider_parent[0].casefold() != movie_name.casefold()
+                or str(provider_parent[1] or "").casefold() not in series_types
+            )
+        if not existing_id:
+            canonical_id, ambiguous = _find_movie_by_canonical_identity(
+                cur,
+                movie_name,
+                movie_year,
+                require_series=is_episode
+                or content_type.casefold() in {"web series", "anime"},
+                content_type=(
+                    None
+                    if is_episode or content_type.casefold() in {"web series", "anime"}
+                    else content_type
+                ),
+            )
+            if ambiguous and not (imdb_id or tmdb_id):
+                _record_ingestion_evidence(
+                    conn,
+                    file_unique_id=file_unique_id,
+                    raw_caption=raw_caption or raw_text,
+                    raw_filename=raw_filename,
+                    evidence=ai_data,
+                    parsed_identity=asdict(parsed_identity),
+                    provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                    movie_id=None,
+                    movie_file_id=None,
+                    resolver_method="ambiguous_canonical_match",
+                    confidence=parsed_identity.confidence,
+                    status="pending_review",
+                    warnings=parsed_identity.parse_warnings + ("Multiple exact canonical matches",),
+                )
+                conn.commit()
+                cur.close()
+                return None
+
+            if canonical_id:
+                cur.execute(
+                    "SELECT imdb_id, tmdb_id FROM movies WHERE id = %s",
+                    (canonical_id,),
+                )
+                stored_imdb_id, stored_tmdb_id = cur.fetchone()
+                identity_conflict = bool(
+                    (imdb_id and stored_imdb_id and imdb_id != stored_imdb_id)
+                    or (tmdb_id and stored_tmdb_id and int(tmdb_id) != int(stored_tmdb_id))
+                )
+                if not identity_conflict:
+                    existing_id = canonical_id
+                    resolver_method = "exact_canonical_series_match"
+
+            if not can_create_canonical_content(
+                parsed_identity,
+                provider_identity=bool(imdb_id or tmdb_id),
+                existing_parent=bool(existing_id),
+                ambiguous=ambiguous,
+                provider_conflict=identity_conflict,
+            ):
+                _record_ingestion_evidence(
+                    conn,
+                    file_unique_id=file_unique_id,
+                    raw_caption=raw_caption or raw_text,
+                    raw_filename=raw_filename,
+                    evidence=ai_data,
+                    parsed_identity=asdict(parsed_identity),
+                    provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                    movie_id=None,
+                    movie_file_id=None,
+                    resolver_method=(
+                        "conflicting_provider_identity"
+                        if identity_conflict
+                        else "episode_without_provider_or_existing_identity"
+                    ),
+                    confidence=parsed_identity.confidence,
+                    status="pending_review",
+                    warnings=parsed_identity.parse_warnings
+                    + (
+                        "Existing canonical row has conflicting provider IDs"
+                        if identity_conflict
+                        else "No provider identity or existing canonical content was found",
+                    ),
+                )
+                conn.commit()
+                cur.close()
+                logger.warning(
+                    "Ingestion held for review: unverified canonical content %r", movie_name
+                )
+                return None
+        if existing_id and resolver_method == "exact_canonical_series_match":
+            cur.execute(
+                "UPDATE movies SET imdb_id = COALESCE(imdb_id, %s), "
+                "tmdb_id = COALESCE(tmdb_id, %s) WHERE id = %s",
+                (imdb_id, tmdb_id, existing_id),
+            )
+            cur.execute("SELECT title, year FROM movies WHERE id = %s", (existing_id,))
+            existing_title, existing_year = cur.fetchone()
+            _record_ingestion_evidence(
+                conn,
+                file_unique_id=file_unique_id,
+                raw_caption=raw_caption or raw_text,
+                raw_filename=raw_filename,
+                evidence=ai_data,
+                parsed_identity=asdict(parsed_identity),
+                provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                movie_id=existing_id,
+                movie_file_id=None,
+                resolver_method=resolver_method,
+                confidence=parsed_identity.confidence,
+                status="resolved",
+                warnings=parsed_identity.parse_warnings,
+            )
+            conn.commit()
+            cur.close()
+            return {
+                "movie_id": existing_id,
+                "title": existing_title,
+                "year": existing_year or year,
+                "genre": genre,
+                "rating": rating,
+                "plot": plot,
+                "category": category,
+                "movie_lang": movie_lang,
+                "poster_url": poster_url,
+                "backdrop_poster_url": backdrop_poster_url if "backdrop_poster_url" in locals() else None,
+                "imdb_id": imdb_id,
+                "tmdb_id": tmdb_id,
+                "cast_str": "",
+                "parsed_identity": asdict(parsed_identity),
+                "raw_caption": raw_caption or raw_text,
+                "raw_filename": raw_filename,
+                "resolver_method": resolver_method,
+                "confidence": parsed_identity.confidence,
+            }
+
+        cast_str = ""
+        if imdb_id:
+            cast_str = await run_async(fetch_cast_from_imdb, imdb_id, 5)
+        trailer_key = await run_async(
+            resolve_trailer_key,
+            title,
+            year,
+            imdb_id,
+            category,
+            movie_name,
+        )
+        artwork_poster_url, backdrop_poster_url = await run_async(
+            fetch_tmdb_artwork,
+            title,
+            year,
+            imdb_id,
+            category,
+        )
+        if artwork_poster_url and not poster_url:
+            poster_url = artwork_poster_url
+
         movie_values = (
             title, imdb_id, tmdb_id, poster_url, backdrop_poster_url, year,
             genre, rating, plot, category, content_type, movie_lang,
@@ -8726,6 +9461,21 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
                 movie_values,
             )
         movie_id = cur.fetchone()[0]
+        _record_ingestion_evidence(
+            conn,
+            file_unique_id=file_unique_id,
+            raw_caption=raw_caption or raw_text,
+            raw_filename=raw_filename,
+            evidence=ai_data,
+            parsed_identity=asdict(parsed_identity),
+            provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+            movie_id=movie_id,
+            movie_file_id=None,
+            resolver_method=resolver_method,
+            confidence=parsed_identity.confidence,
+            status="resolved",
+            warnings=parsed_identity.parse_warnings,
+        )
         conn.commit()
         cur.close()
 
@@ -8743,6 +9493,11 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
             'imdb_id':    imdb_id,
             'tmdb_id':    tmdb_id,
             'cast_str':   cast_str,
+            'parsed_identity': asdict(parsed_identity),
+            'raw_caption': raw_caption or raw_text,
+            'raw_filename': raw_filename,
+            'resolver_method': resolver_method,
+            'confidence': parsed_identity.confidence,
         }
     except Exception as e:
         logger.error(f"_core_movie_processor DB Error: {e}")
@@ -8756,6 +9511,50 @@ async def _core_movie_processor(raw_text: str, image_bytes: bytes = None, reconc
 # 📤 _pm_save_file — pm_file_listener ka Phase 2 (ek jagah, sab use karein)
 # superbatch_done bhi isko call karta hai — alag/duplicate code nahi
 # ==============================================================================
+def _parse_file_identity_for_parent(raw_caption, raw_filename, parent_title):
+    """Keep episode metadata from the file only when it belongs to this parent."""
+    _, parsed, _ = resolve_raw_content_identity(raw_caption, raw_filename)
+    if not parsed or not (
+        parsed.has_episode_marker or parsed.season_number is not None
+    ):
+        return {}
+    if parsed.canonical_title.casefold() != str(parent_title or "").casefold():
+        return {}
+    result = asdict(parsed)
+    result["canonical_title"] = parent_title
+    return result
+
+
+def _resolve_episode_file_parent(cur, requested_movie_id, raw_caption, raw_filename, year=None):
+    """Resolve episode files to a unique existing series before any file is saved."""
+    evidence = [
+        parse_content_identity(value)
+        for value in (raw_caption, raw_filename)
+        if value
+    ]
+    if not any(
+        parsed.has_episode_marker or parsed.season_number is not None
+        for parsed in evidence
+    ):
+        return requested_movie_id, None
+
+    _, parsed, error = resolve_raw_content_identity(raw_caption, raw_filename)
+    if not parsed or error:
+        return None, error or "Episode identity is ambiguous"
+    resolved_year = int(year) if str(year or "").isdigit() else None
+    canonical_id, ambiguous = _find_movie_by_canonical_identity(
+        cur,
+        parsed.canonical_title,
+        resolved_year,
+        require_series=True,
+    )
+    if ambiguous:
+        return None, "Multiple canonical series rows match this episode"
+    if not canonical_id:
+        return None, "No existing canonical series row matches this episode"
+    return canonical_id, parsed
+
+
 async def _pm_save_file(message, context) -> str | None:
     """
     Unified Phase 2 saver. Gemini bilkul use nahi hota.
@@ -8789,12 +9588,101 @@ async def _pm_save_file(message, context) -> str | None:
     label = _merge_quality_labels(cap_label, fn_label)
     f_lang = _merge_csv_values(cap_data.get('language'), fn_data.get('language'))
     f_extra = _merge_extra_info(cap_data.get('extra_info'), fn_data.get('extra_info'))
+    identity_title = (
+        (BATCH_SESSION.get('parsed_identity') or {}).get('canonical_title')
+        or BATCH_SESSION.get('movie_title')
+    )
+    file_identity = _parse_file_identity_for_parent(
+        raw_caption, file_name, identity_title
+    )
 
     # Downgrade check BEFORE copying to channels, taaki rejected orphan uploads na banein.
     precheck_conn = get_db_connection()
     if not precheck_conn:
         return None
     try:
+        cur = precheck_conn.cursor()
+        resolved_movie_id, episode_identity = _resolve_episode_file_parent(
+            cur,
+            movie_id,
+            raw_caption,
+            file_name,
+            BATCH_SESSION.get("year"),
+        )
+        if not resolved_movie_id:
+            _record_ingestion_evidence(
+                precheck_conn,
+                file_unique_id=file_unique_id,
+                raw_caption=raw_caption,
+                raw_filename=file_name,
+                evidence={"caption": cap_data, "filename": fn_data},
+                parsed_identity=file_identity,
+                provider_ids={
+                    "imdb_id": BATCH_SESSION.get("imdb_id"),
+                    "tmdb_id": BATCH_SESSION.get("tmdb_id"),
+                },
+                movie_id=None,
+                movie_file_id=None,
+                resolver_method="episode_parent_unresolved",
+                confidence=file_identity.get("confidence", 0),
+                status="pending_review",
+                warnings=(episode_identity,),
+            )
+            precheck_conn.commit()
+            logger.warning("Episode file held before upload: %s", episode_identity)
+            return None
+        if resolved_movie_id != movie_id or episode_identity is not None:
+            cur.execute("SELECT title FROM movies WHERE id = %s", (resolved_movie_id,))
+            resolved_title = cur.fetchone()[0]
+            movie_id = resolved_movie_id
+            BATCH_SESSION.update(
+                movie_id=movie_id,
+                movie_title=resolved_title,
+            )
+            file_identity = _parse_file_identity_for_parent(
+                raw_caption, file_name, resolved_title
+            )
+        cur.close()
+
+        if file_unique_id:
+            cur = precheck_conn.cursor()
+            cur.execute(
+                "SELECT id, movie_id FROM movie_files WHERE file_unique_id = %s",
+                (file_unique_id,),
+            )
+            prior_file = cur.fetchone()
+            cur.close()
+            if prior_file:
+                if prior_file[1] != movie_id:
+                    logger.error(
+                        "Telegram file %s is already attached to movie %s, not %s",
+                        file_unique_id, prior_file[1], movie_id,
+                    )
+                    return None
+                _link_movie_file_episodes(
+                    precheck_conn, prior_file[0], movie_id, file_identity
+                )
+                _record_ingestion_evidence(
+                    precheck_conn,
+                    file_unique_id=file_unique_id,
+                    raw_caption=raw_caption,
+                    raw_filename=file_name,
+                    evidence={"caption": cap_data, "filename": fn_data},
+                    parsed_identity=file_identity,
+                    provider_ids={
+                        "imdb_id": BATCH_SESSION.get("imdb_id"),
+                        "tmdb_id": BATCH_SESSION.get("tmdb_id"),
+                    },
+                    movie_id=movie_id,
+                    movie_file_id=prior_file[0],
+                    resolver_method=BATCH_SESSION.get("resolver_method", "batch_session"),
+                    confidence=file_identity.get(
+                        "confidence", BATCH_SESSION.get("confidence", 0)
+                    ),
+                    status="resolved",
+                )
+                precheck_conn.commit()
+                return label
         rejected, existing = is_downgrade(movie_id, label, f_extra, precheck_conn)
     except Exception as exc:
         logger.error("_pm_save_file pre-upload downgrade check failed: %s", exc)
@@ -8842,9 +9730,29 @@ async def _pm_save_file(message, context) -> str | None:
         return None
 
     try:
-        upsert_movie_file(
+        movie_file_id = upsert_movie_file(
             conn, movie_id, label, file_size_str, main_url,
             json.dumps(backup_map), f_lang, f_extra, file_unique_id,
+        )
+        _link_movie_file_episodes(conn, movie_file_id, movie_id, file_identity)
+        _record_ingestion_evidence(
+            conn,
+            file_unique_id=file_unique_id,
+            raw_caption=raw_caption,
+            raw_filename=file_name,
+            evidence={"caption": cap_data, "filename": fn_data},
+            parsed_identity=file_identity,
+            provider_ids={
+                "imdb_id": BATCH_SESSION.get("imdb_id"),
+                "tmdb_id": BATCH_SESSION.get("tmdb_id"),
+            },
+            movie_id=movie_id,
+            movie_file_id=movie_file_id,
+            resolver_method=BATCH_SESSION.get("resolver_method", "batch_session"),
+            confidence=file_identity.get(
+                "confidence", BATCH_SESSION.get("confidence", 0)
+            ),
+            status="resolved",
         )
         BATCH_SESSION['file_count'] = BATCH_SESSION.get('file_count', 0) + 1
         logger.info(
@@ -8861,6 +9769,7 @@ async def _pm_save_file(message, context) -> str | None:
             logger.error("Auto-Upgrade error in _pm_save_file: %s", exc)
 
         return label
+
     except Exception as exc:
         logger.error("_pm_save_file DB error: %s", exc)
         try:
@@ -9029,6 +9938,9 @@ async def pm_file_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raw_caption or raw_filename,
                 image_bytes,
                 reconciled_data=reconciled_data,
+                raw_caption=raw_caption,
+                raw_filename=raw_filename,
+                file_unique_id=getattr(message.document or message.video, 'file_unique_id', None),
             )
 
             if not result:
@@ -9058,16 +9970,29 @@ async def pm_file_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             BATCH_SESSION.update({
                 'active': True, 'movie_id': movie_id, 'movie_title': title,
                 'file_count': file_count, 'admin_id': ADMIN_USER_ID,
-                'year': str(year) if year else "", 'category': category, 'language': movie_lang
+                'year': str(year) if year else "", 'category': category, 'language': movie_lang,
+                'parsed_identity': result.get('parsed_identity', {}),
+                'resolver_method': result.get('resolver_method', ''),
+                'confidence': result.get('confidence', 0),
+                'imdb_id': result.get('imdb_id'),
+                'tmdb_id': result.get('tmdb_id'),
             })
 
+            first_file_label = await _pm_save_file(message, context)
+            first_file_status = (
+                "✅ First file saved.\n"
+                if first_file_label
+                else "⚠️ First file was not saved; please retry it.\n"
+            )
             keyboard = []
             if file_count > 0:
                 keyboard.append([InlineKeyboardButton("🗑️ Delete OLD Files", callback_data=f"clearfiles_{movie_id}")])
             keyboard.append([InlineKeyboardButton("❌ Cancel Batch", callback_data="cancel_batch")])
 
             await status_msg.edit_text(
-                f"✅ **Batch Started!**\n\n🎬 Movie: **{title}**\n📅 Year: {year if year else 'N/A'}\n🏷️ Category: {category}\n\n🚀 **Ab apni files bhejna shuru karo!**\nJab ho jaye: `/done`",
+                f"✅ **Batch Started!**\n\n🎬 Movie: **{title}**\n📅 Year: {year if year else 'N/A'}\n🏷️ Category: {category}\n"
+                f"{first_file_status}\n"
+                f"🚀 **Ab apni files bhejna shuru karo!**\nJab ho jaye: `/done`",
                 parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -10731,10 +11656,38 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             movie_extra = fallback_data.get("extra_info", "")
             gemini_category = "Adult" if force_adult else "Web Series"
 
-        if movie_name == "UNKNOWN" or len(movie_name) < 2:
+        identity_source, parsed_identity, identity_error = resolve_raw_content_identity(
+            raw_caption, raw_filename
+        )
+        if not parsed_identity:
+            _record_pending_identity(
+                getattr(message.document or message.video, "file_unique_id", None),
+                raw_caption,
+                raw_filename,
+                {"identity_source": "batch18"},
+                asdict(parse_content_identity(raw_caption or raw_filename)),
+                identity_error or "No plausible canonical content title was found",
+            )
             await status_msg.edit_text(
                 "❌ Name identify nahi ho paya. Sahi naam ke sath dobara bhejein."
             )
+            return
+        movie_name = parsed_identity.canonical_title
+        movie_year = movie_year or parsed_identity.year or ""
+        if not str(movie_year).isdigit():
+            movie_year = parsed_identity.year or ""
+        if parsed_identity.has_episode_marker or parsed_identity.season_number is not None:
+            movie_extra = ""
+        if not is_safe_canonical_title(movie_name):
+            _record_pending_identity(
+                getattr(message.document or message.video, "file_unique_id", None),
+                raw_caption,
+                raw_filename,
+                {"identity_source": "batch18"},
+                asdict(parsed_identity),
+                "No safe canonical title remained after parsing",
+            )
+            await status_msg.edit_text("❌ Identity unclear; content was not added.")
             return
         
         await status_msg.edit_text(
@@ -10753,6 +11706,25 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
         combo = await fetch_adult_metadata_combo(movie_name, movie_year, movie_lang, raw_caption, raw_filename)
 
         title     = combo["title"]
+        if not is_safe_canonical_title(title):
+            title = movie_name
+        is_episode = parsed_identity.has_episode_marker or parsed_identity.season_number is not None
+        if is_episode:
+            provider_title = parse_content_identity(title).canonical_title
+            if provider_title.casefold() != movie_name.casefold():
+                _record_pending_identity(
+                    getattr(message.document or message.video, "file_unique_id", None),
+                    raw_caption,
+                    raw_filename,
+                    ai_data if "ai_data" in locals() else {},
+                    asdict(parsed_identity),
+                    "Provider title does not confirm the raw episode's canonical series",
+                )
+                await status_msg.edit_text(
+                    "⚠️ Series identity could not be verified. No movie row or file was created."
+                )
+                return
+            title = movie_name
         year      = combo["year"]
         poster_url = combo["poster_url"]
         genre     = combo["genre"]
@@ -10788,7 +11760,111 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resolve_tmdb_id_from_imdb, imdb_id, category
             )
             existing = None
-            existing_id = _find_movie_by_provider_identity(cur, imdb_id, tmdb_id)
+            try:
+                existing_id = _find_movie_by_provider_identity(cur, imdb_id, tmdb_id)
+            except ValueError as exc:
+                media = message.document or message.video
+                _record_ingestion_evidence(
+                    conn,
+                    file_unique_id=getattr(media, "file_unique_id", None),
+                    raw_caption=raw_caption,
+                    raw_filename=raw_filename,
+                    evidence=ai_data if "ai_data" in locals() else {},
+                    parsed_identity=asdict(parsed_identity),
+                    provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                    movie_id=None,
+                    movie_file_id=None,
+                    resolver_method="conflicting_provider_identity",
+                    confidence=parsed_identity.confidence,
+                    status="pending_review",
+                    warnings=parsed_identity.parse_warnings + (str(exc),),
+                )
+                conn.commit()
+                cur.close()
+                await status_msg.edit_text(
+                    "⚠️ Provider identities conflict. No movie row or file was created."
+                )
+                return
+            resolver_method = "provider_identity" if existing_id else "provider_metadata"
+            identity_conflict = False
+            ambiguous = False
+            if existing_id and is_episode:
+                cur.execute(
+                    "SELECT title, content_type FROM movies WHERE id = %s",
+                    (existing_id,),
+                )
+                provider_parent = cur.fetchone()
+                series_types = {"web series", "tv series", "tv show", "series", "anime"}
+                identity_conflict = bool(
+                    not provider_parent
+                    or provider_parent[0].casefold() != movie_name.casefold()
+                    or str(provider_parent[1] or "").casefold() not in series_types
+                )
+            if not existing_id:
+                series_identity = (
+                    is_episode
+                    or "series" in str(evidence_category).casefold()
+                )
+                canonical_id, ambiguous = _find_movie_by_canonical_identity(
+                    cur,
+                    movie_name,
+                    movie_year,
+                    require_series=series_identity,
+                    content_type=None if series_identity else "Movie",
+                )
+                if canonical_id:
+                    cur.execute(
+                        "SELECT imdb_id, tmdb_id FROM movies WHERE id = %s",
+                        (canonical_id,),
+                    )
+                    stored_imdb_id, stored_tmdb_id = cur.fetchone()
+                    identity_conflict = bool(
+                        (imdb_id and stored_imdb_id and imdb_id != stored_imdb_id)
+                        or (
+                            tmdb_id and stored_tmdb_id
+                            and int(tmdb_id) != int(stored_tmdb_id)
+                        )
+                    )
+                    if not identity_conflict:
+                        existing_id = canonical_id
+                        resolver_method = "exact_canonical_match"
+
+            if not can_create_canonical_content(
+                parsed_identity,
+                provider_identity=bool(imdb_id or tmdb_id),
+                existing_parent=bool(existing_id),
+                ambiguous=ambiguous,
+                provider_conflict=identity_conflict,
+            ):
+                reason = (
+                    "Multiple exact canonical matches"
+                    if ambiguous
+                    else "Existing canonical row has conflicting provider IDs"
+                    if identity_conflict
+                    else "No provider identity or existing canonical content was found"
+                )
+                media = message.document or message.video
+                _record_ingestion_evidence(
+                    conn,
+                    file_unique_id=getattr(media, "file_unique_id", None),
+                    raw_caption=raw_caption,
+                    raw_filename=raw_filename,
+                    evidence=ai_data if "ai_data" in locals() else {},
+                    parsed_identity=asdict(parsed_identity),
+                    provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                    movie_id=None,
+                    movie_file_id=None,
+                    resolver_method="unverified_content_identity",
+                    confidence=parsed_identity.confidence,
+                    status="pending_review",
+                    warnings=parsed_identity.parse_warnings + (reason,),
+                )
+                conn.commit()
+                cur.close()
+                await status_msg.edit_text(
+                    "⚠️ Content identity needs review. No movie row or file was created."
+                )
+                return
             if existing_id:
                 cur.execute(
                     "SELECT id, poster_url, year FROM movies WHERE id = %s",
@@ -10808,6 +11884,8 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     genre=genre,
                     title=title,
                 )
+                if parsed_identity.has_episode_marker or parsed_identity.season_number is not None:
+                    content_type = "Web Series"
                 
                 cur.execute("""
                     UPDATE movies 
@@ -10841,6 +11919,8 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     genre=genre,
                     title=title,
                 )
+                if parsed_identity.has_episode_marker or parsed_identity.season_number is not None:
+                    content_type = "Web Series"
                 cur.execute("""
                     INSERT INTO movies 
                     (title, url, imdb_id, tmdb_id, poster_url, year, genre, rating, 
@@ -10866,8 +11946,31 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_count': 0,
                 'year': str(year) if year else movie_year,
                 'category': category,
-                'language': movie_lang
+                'language': movie_lang,
+                'parsed_identity': asdict(parsed_identity),
+                'resolver_method': resolver_method,
+                'confidence': parsed_identity.confidence,
+                'imdb_id': imdb_id,
+                'tmdb_id': tmdb_id,
+                'raw_caption': raw_caption,
+                'raw_filename': raw_filename,
             })
+            _record_ingestion_evidence(
+                conn,
+                file_unique_id=getattr(message.document or message.video, "file_unique_id", None),
+                raw_caption=raw_caption,
+                raw_filename=raw_filename,
+                evidence=ai_data if "ai_data" in locals() else {},
+                parsed_identity=asdict(parsed_identity),
+                provider_ids={"imdb_id": imdb_id, "tmdb_id": tmdb_id},
+                movie_id=movie_id,
+                movie_file_id=None,
+                resolver_method=resolver_method,
+                confidence=parsed_identity.confidence,
+                status="resolved",
+                warnings=parsed_identity.parse_warnings,
+            )
+            conn.commit()
 
             # Build success message
             cast_display = f"\n👥 **Cast:** {cast_str}" if cast_str else ""
@@ -10909,16 +12012,131 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"❌ 18+ DB Error: {e}")
             if conn: conn.rollback()
             await status_msg.edit_text(f"❌ Database Error: {e}")
+            return
         finally:
             close_db_connection(conn)
-        
-        return  # First file processed, wait for more
 
     # === PHASE 2: SUBSEQUENT FILES ===
     upload_status = await message.reply_text(
         "⏳ Saving 18+ file...", 
         quote=True
     )
+
+    media = message.document or message.video
+    file_unique_id = getattr(media, "file_unique_id", None)
+    file_name = getattr(media, "file_name", None) or "File"
+    raw_caption = message.caption or message.text or ""
+    file_identity = _parse_file_identity_for_parent(
+        raw_caption,
+        file_name,
+        (BATCH_18_SESSION.get("parsed_identity") or {}).get("canonical_title")
+        or BATCH_18_SESSION.get("movie_title"),
+    )
+    parent_conn = get_db_connection()
+    if not parent_conn:
+        await upload_status.edit_text("❌ Database Connection Failed.")
+        return
+    try:
+        cur = parent_conn.cursor()
+        resolved_movie_id, episode_identity = _resolve_episode_file_parent(
+            cur,
+            BATCH_18_SESSION.get("movie_id"),
+            raw_caption,
+            file_name,
+            BATCH_18_SESSION.get("year"),
+        )
+        if not resolved_movie_id:
+            _record_ingestion_evidence(
+                parent_conn,
+                file_unique_id=file_unique_id,
+                raw_caption=raw_caption,
+                raw_filename=file_name,
+                evidence={"source": "batch18"},
+                parsed_identity=file_identity,
+                provider_ids={
+                    "imdb_id": BATCH_18_SESSION.get("imdb_id"),
+                    "tmdb_id": BATCH_18_SESSION.get("tmdb_id"),
+                },
+                movie_id=None,
+                movie_file_id=None,
+                resolver_method="episode_parent_unresolved",
+                confidence=file_identity.get("confidence", 0),
+                status="pending_review",
+                warnings=(episode_identity,),
+            )
+            parent_conn.commit()
+            await upload_status.edit_text(
+                "⚠️ Episode parent could not be uniquely verified; no file was uploaded."
+            )
+            return
+        if resolved_movie_id != BATCH_18_SESSION.get("movie_id") or episode_identity is not None:
+            cur.execute("SELECT title FROM movies WHERE id = %s", (resolved_movie_id,))
+            resolved_title = cur.fetchone()[0]
+            BATCH_18_SESSION.update(
+                movie_id=resolved_movie_id,
+                movie_title=resolved_title,
+            )
+            file_identity = _parse_file_identity_for_parent(
+                raw_caption, file_name, resolved_title
+            )
+        cur.close()
+    except Exception as exc:
+        logger.exception("Batch18 episode parent resolution failed")
+        await upload_status.edit_text("❌ Could not verify the episode's series parent.")
+        return
+    finally:
+        close_db_connection(parent_conn)
+
+    if file_unique_id:
+        duplicate_conn = get_db_connection()
+        if not duplicate_conn:
+            await upload_status.edit_text("❌ Database Connection Failed.")
+            return
+        try:
+            cur = duplicate_conn.cursor()
+            cur.execute(
+                "SELECT id, movie_id FROM movie_files WHERE file_unique_id = %s",
+                (file_unique_id,),
+            )
+            prior_file = cur.fetchone()
+            cur.close()
+            if prior_file:
+                if prior_file[1] != BATCH_18_SESSION.get("movie_id"):
+                    await upload_status.edit_text(
+                        "❌ This Telegram file is already attached to a different title."
+                    )
+                    return
+                _link_movie_file_episodes(
+                    duplicate_conn, prior_file[0], prior_file[1], file_identity
+                )
+                _record_ingestion_evidence(
+                    duplicate_conn,
+                    file_unique_id=file_unique_id,
+                    raw_caption=raw_caption,
+                    raw_filename=file_name,
+                    evidence={"source": "batch18_retry"},
+                    parsed_identity=file_identity,
+                    provider_ids={
+                        "imdb_id": BATCH_18_SESSION.get("imdb_id"),
+                        "tmdb_id": BATCH_18_SESSION.get("tmdb_id"),
+                    },
+                    movie_id=prior_file[1],
+                    movie_file_id=prior_file[0],
+                    resolver_method=BATCH_18_SESSION.get("resolver_method", "batch18_session"),
+                    confidence=file_identity.get(
+                        "confidence", BATCH_18_SESSION.get("confidence", 0)
+                    ),
+                    status="resolved",
+                )
+                duplicate_conn.commit()
+                await upload_status.edit_text("✅ Duplicate upload detected; existing file kept.")
+                return
+        except Exception as exc:
+            logger.error("Batch18 duplicate check failed: %s", exc)
+            await upload_status.edit_text("❌ Could not verify duplicate file identity.")
+            return
+        finally:
+            close_db_connection(duplicate_conn)
 
     # Get storage channels
     channels = get_storage_channels()
@@ -10933,8 +12151,6 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"18+ Backup failed for {chat_id}: {e}")
 
     # Extract file info
-    file_name = (message.document.file_name if message.document 
-                 else (message.video.file_name if message.video else "File"))
     file_size = (message.document.file_size if message.document 
                  else (message.video.file_size if message.video else 0))
     file_size_str = get_readable_file_size(file_size)
@@ -10975,12 +12191,32 @@ async def batch18_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 close_db_connection(conn)
                 return
 
-            file_unique_id = (message.document.file_unique_id if message.document
-                              else message.video.file_unique_id if message.video
-                              else message.photo[-1].file_unique_id if message.photo else None)
-
-            upsert_movie_file(conn, BATCH_18_SESSION['movie_id'], label, file_size_str, main_url,
-                              json.dumps(backup_map), f_lang, f_extra, file_unique_id)
+            movie_file_id = upsert_movie_file(
+                conn, BATCH_18_SESSION['movie_id'], label, file_size_str, main_url,
+                json.dumps(backup_map), f_lang, f_extra, file_unique_id,
+            )
+            _link_movie_file_episodes(
+                conn, movie_file_id, BATCH_18_SESSION["movie_id"], file_identity
+            )
+            _record_ingestion_evidence(
+                conn,
+                file_unique_id=file_unique_id,
+                raw_caption=raw_caption,
+                raw_filename=file_name,
+                evidence={"source": "batch18_file", "language": f_lang, "extra_info": f_extra},
+                parsed_identity=file_identity,
+                provider_ids={
+                    "imdb_id": BATCH_18_SESSION.get("imdb_id"),
+                    "tmdb_id": BATCH_18_SESSION.get("tmdb_id"),
+                },
+                movie_id=BATCH_18_SESSION["movie_id"],
+                movie_file_id=movie_file_id,
+                resolver_method=BATCH_18_SESSION.get("resolver_method", "batch18_session"),
+                confidence=file_identity.get(
+                    "confidence", BATCH_18_SESSION.get("confidence", 0)
+                ),
+                status="resolved",
+            )
             
             BATCH_18_SESSION['file_count'] += 1
 
@@ -11346,6 +12582,11 @@ async def add_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         value = parts[-1]  # Last part is link/id/unreleased
         title = " ".join(parts[:-1]) # Rest is title
+        if not is_safe_canonical_title(title):
+            await update.message.reply_text(
+                "❌ Use a canonical movie/series title without episode or release metadata."
+            )
+            return
 
         logger.info(f"Adding movie: {title} with value: {value}")
 
@@ -11609,6 +12850,10 @@ Movie3 file_id_here
 
             url_or_id = parts[-1]
             title = ' '.join(parts[:-1])
+            if not is_safe_canonical_title(title):
+                failed_count += 1
+                results.append(f"❌ {title} - title contains episode or release metadata")
+                continue
 
             try:
                 conn = get_db_connection()
@@ -13279,25 +14524,42 @@ def run_flask():
 async def start_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1: User clicks 'Request This Movie' -> Show Short & Stylish Guidelines"""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        logger.exception("Could not acknowledge request callback")
 
     # Failed search results can open the request confirmation directly in chat.
     # The regular `request_` entry point remains unchanged and still asks for a name.
     if query.data.startswith("request_prefill_"):
         movie_title = unquote(query.data[len("request_prefill_"):]).strip()
-        if movie_title:
-            context.user_data['temp_request_name'] = movie_title
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes, Confirm", callback_data="confirm_yes"),
-                InlineKeyboardButton("❌ No, Cancel", callback_data="confirm_no")
-            ]])
-            await query.edit_message_text(
-                f"🔔 <b>Confirmation Required</b>\n\n"
-                f"क्या आप <b>'{movie_title}'</b> को रिक्वेस्ट करना चाहते हैं?",
+        if not movie_title:
+            await _replace_search_result_message(
+                query,
+                context,
+                "⚠️ The requested title was empty. Please search again.",
+            )
+            return ConversationHandler.END
+        context.user_data['temp_request_name'] = movie_title
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, Confirm", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data="confirm_no")
+        ]])
+        try:
+            await _replace_search_result_message(
+                query,
+                context,
+                (
+                    "🔔 <b>Confirmation Required</b>\n\n"
+                    f"Do you want to request <b>'{html_escape(movie_title)}'</b>?"
+                ),
                 reply_markup=keyboard,
-                parse_mode='HTML'
             )
             return CONFIRMATION
+        except Exception:
+            logger.exception("Could not open prefilled request confirmation")
+            context.user_data.pop('temp_request_name', None)
+            return ConversationHandler.END
     
     # --- NEW STYLISH & SHORT TEXT ---
     request_instruction_text = (
@@ -13316,14 +14578,24 @@ async def start_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     
     # Message Edit karein
-    await query.edit_message_text(
-        text=request_instruction_text,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
+    try:
+        request_message = await _replace_search_result_message(
+            query,
+            context,
+            request_instruction_text,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Could not open request instructions")
+        return ConversationHandler.END
     
     # Is instruction message ko bhi delete list me daal dein (2 min baad)
-    track_message_for_deletion(context, update.effective_chat.id, query.message.message_id, USER_TEXT_DELETE_SECONDS)
+    track_message_for_deletion(
+        context,
+        update.effective_chat.id,
+        getattr(request_message, "message_id", query.message.message_id),
+        USER_TEXT_DELETE_SECONDS,
+    )
     
     # State change -> Ab Bot sirf Name ka wait karega
     return WAITING_FOR_NAME
@@ -13380,7 +14652,11 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
     user = query.from_user
     
     if choice == "confirm_no":
-        await query.edit_message_text("❌ Request Cancelled. आप दोबारा सर्च या रिक्वेस्ट कर सकते हैं।")
+        await _replace_search_result_message(
+            query,
+            context,
+            "❌ Request Cancelled. आप दोबारा सर्च या रिक्वेस्ट कर सकते हैं।",
+        )
         # Cancel message auto delete in 10 seconds
         track_message_for_deletion(context, chat_id, query.message.message_id, USER_TEXT_DELETE_SECONDS)
         context.user_data.pop('temp_request_name', None)
@@ -13390,14 +14666,25 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
         movie_title = context.user_data.get('temp_request_name')
         
         # --- FINAL SAVE TO DATABASE ---
-        stored = await run_async(store_user_request,
-            user.id,
-            user.username,
-            user.first_name,
-            movie_title,
-            query.message.chat.id if query.message.chat.type != "private" else None,
-            query.message.message_id
-        )
+        try:
+            stored = await run_async(
+                store_user_request,
+                user.id,
+                user.username,
+                user.first_name,
+                movie_title,
+                query.message.chat.id if query.message.chat.type != "private" else None,
+                query.message.message_id,
+            )
+        except Exception:
+            logger.exception("Could not save request from confirmation callback")
+            await _replace_search_result_message(
+                query,
+                context,
+                "⚠️ The request could not be submitted right now. Please try again.",
+            )
+            context.user_data.pop('temp_request_name', None)
+            return ConversationHandler.END
         
         if stored:
             # Notify Admin
@@ -13407,16 +14694,22 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
             success_text = f"""
 ✅ <b>Request Sent to Admin!</b>
 
-🎬 Movie: <b>{movie_title}</b>
+🎬 Movie: <b>{html_escape(str(movie_title or ''))}</b>
 
 📝 आपकी रिक्वेस्ट 𝑶𝒘𝒏𝒆𝒓 <b>@Ownermahi</b> / <b>@Ownermahi</b> को मिली गई है।
 ⏳ जैसे ही मूवी उपलब्ध होगी, वो खुद आपको यहाँ सूचित (Notify) कर देंगे।
 
 <i>हमसे जुड़े रहने के लिए धन्यवाद! 🙏</i>
             """
-            await query.edit_message_text(success_text, parse_mode='HTML')
+            await _replace_search_result_message(
+                query, context, success_text, parse_mode='HTML'
+            )
         else:
-            await query.edit_message_text("❌ Error: Request save नहीं हो पाई। शायद यह पहले से पेंडिंग है।")
+            await _replace_search_result_message(
+                query,
+                context,
+                "❌ Error: Request save नहीं हो पाई। शायद यह पहले से पेंडिंग है।",
+            )
             
         # ⚡ Success Message Auto Delete (60 Seconds)
         track_message_for_deletion(context, chat_id, query.message.message_id, USER_TEXT_DELETE_SECONDS)
@@ -13548,72 +14841,231 @@ async def main_menu_or_search(update: Update, context: ContextTypes.DEFAULT_TYPE
 # 👇👇👇 IS FUNCTION KO REPLACE KARO (Line ~1665) 👇👇👇
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle messages in groups using FAST SQL Search.
-    Agar movie database me hai to reply karega, nahi to chup rahega.
-    """
+    """Search a group message and report results, absence, or failure."""
+    handler_entry = time.perf_counter()
     if not update.message or not update.message.text:
         return
-    
+
     text = update.message.text.strip()
-    
-    # 1. Commands ignore karo
     if text.startswith('/'):
         return
-    
-    # 2. Bahut chote words ignore karo
     if len(text) < 2:
         return
 
-    # 3. 🚀 FAST SEARCH CALL (Sirf SQL Check)
-    # Hum 5 results maang rahe hain taaki agar typos ho to best match mile
-    movies = await run_async(get_movies_fast_sql, text, limit=5)
-    schedule_recommendation_event(
-        user_id=update.effective_user.id if update.effective_user else None,
-        event_type='group_search',
-        source='group',
-        metadata={'query': text[:200], 'chat_id': update.effective_chat.id},
-    )
+    requester_id = update.effective_user.id if update.effective_user else None
+    search_started = handler_entry
+    if SEARCH_TIMING_ENABLED:
+        logger.info("Search timing stage=group_handler_entry query=%r", text[:80])
+    progress_message = None
+    progress_start = time.perf_counter()
+    try:
+        progress_message = await update.message.reply_text(
+            f'🔎 Search for "{html_escape(text[:100])}"...'
+        )
+    except Exception:
+        logger.exception("Could not send group-search progress")
+    if SEARCH_TIMING_ENABLED:
+        logger.info(
+            "Search timing stage=group_progress query=%r telegram_ms=%.2f",
+            text[:80],
+            (time.perf_counter() - progress_start) * 1000,
+        )
+    try:
+        movies = await run_async(get_movies_fast_sql, text, limit=5)
+    except Exception:
+        logger.exception("Group movie search failed for query %r", text[:200])
+        try:
+            response_started = time.perf_counter()
+            await _update_search_progress(
+                progress_message,
+                update.message,
+                "⚠️ Search is temporarily unavailable. Please try again.",
+            )
+            if SEARCH_TIMING_ENABLED:
+                logger.info(
+                    "Group search timing query=%r total_ms=%.2f response_ms=%.2f "
+                    "fallback_ms=0 result=error",
+                    text[:80],
+                    (time.perf_counter() - search_started) * 1000,
+                    (time.perf_counter() - response_started) * 1000,
+                )
+        except Exception:
+            logger.exception("Could not send group-search error response")
+        return
+
+    try:
+        schedule_recommendation_event(
+            user_id=requester_id,
+            event_type='group_search',
+            source='group',
+            metadata={'query': text[:200], 'chat_id': update.effective_chat.id},
+        )
+    except Exception:
+        logger.exception("Could not record group-search event")
 
     if not movies:
-        # 🤫 Agar movie nahi mili, to YAHIN RUK JAO.
-        # Bot kuch reply nahi karega, group me shanti rahegi.
+        result_format_start = time.perf_counter()
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔎 Check spelling",
+                url="https://www.google.com/search?{}".format(
+                    urlencode({"q": text[:200]})
+                ),
+            )
+        ]])
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Search timing stage=group_result_format query=%r format_ms=%.2f",
+                text[:80],
+                (time.perf_counter() - result_format_start) * 1000,
+            )
+        try:
+            response_started = time.perf_counter()
+            await _update_search_progress(
+                progress_message,
+                update.message,
+                (
+                    "❌ No matching movie found for:\n"
+                    f"<b>{html_escape(text[:200])}</b>\n\n"
+                    "Check the spelling, add the year, or search privately with /start."
+                ),
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            if SEARCH_TIMING_ENABLED:
+                logger.info(
+                    "Group search timing query=%r total_ms=%.2f response_ms=%.2f "
+                    "fallback_ms=0 result=not_found",
+                    text[:80],
+                    (time.perf_counter() - search_started) * 1000,
+                    (time.perf_counter() - response_started) * 1000,
+                )
+        except Exception:
+            logger.exception("Could not send group no-results response")
         return
 
-    # 4. Results mil gaye, ab show karo
-    chosen_movie = _select_single_search_result(text, movies)
-    
+    selection_start = time.perf_counter()
+    try:
+        chosen_movie = _select_single_search_result(text, movies)
+    except Exception:
+        logger.exception("Could not select a group-search result")
+        try:
+            await _update_search_progress(
+                progress_message,
+                update.message,
+                "⚠️ Search results could not be displayed. Please try again."
+            )
+        except Exception:
+            logger.exception("Could not send group result error response")
+        return
+    if SEARCH_TIMING_ENABLED:
+        logger.info(
+            "Search timing stage=group_result_selection query=%r python_ms=%.2f",
+            text[:80],
+            (time.perf_counter() - selection_start) * 1000,
+        )
+
     if chosen_movie:
         movie_id, title, url, file_id = chosen_movie[:4]
-        schedule_recommendation_event(
-            user_id=update.effective_user.id if update.effective_user else None,
-            event_type='group_selection',
-            source='group',
-            movie_id=movie_id,
-            metadata={'query': text[:200], 'title': title, 'chat_id': update.effective_chat.id},
-        )
-        # Exact match par qualities menu dikhao
-        await process_movie_exact_match(update, context, movie_id, title)
+        try:
+            schedule_recommendation_event(
+                user_id=requester_id,
+                event_type='group_selection',
+                source='group',
+                movie_id=movie_id,
+                metadata={
+                    'query': text[:200],
+                    'title': title,
+                    'chat_id': update.effective_chat.id,
+                },
+            )
+        except Exception:
+            logger.exception("Could not record group result selection")
+        try:
+            response_started = time.perf_counter()
+            await process_movie_exact_match(
+                update,
+                context,
+                movie_id,
+                title,
+                status_message=progress_message,
+            )
+            if SEARCH_TIMING_ENABLED:
+                logger.info(
+                    "Group search timing query=%r total_ms=%.2f response_ms=%.2f "
+                    "fallback_ms=0 result=exact",
+                    text[:80],
+                    (time.perf_counter() - search_started) * 1000,
+                    (time.perf_counter() - response_started) * 1000,
+                )
+        except Exception:
+            logger.exception("Could not display exact group-search result")
+            try:
+                await _update_search_progress(
+                    progress_message,
+                    update.message,
+                    "⚠️ Search results could not be displayed. Please try again.",
+                )
+            except Exception:
+                logger.exception("Could not send group result error response")
         return
 
-    context.user_data['search_results'] = movies
-    context.user_data['search_query'] = text
-
-    # 🔒 Group me user_id pass karo taaki sirf requester hi buttons click kar sake
-    requester_id = update.effective_user.id
-    keyboard = create_movie_selection_keyboard(movies, page=0, requester_id=requester_id)
-    
-    # Reply to user with premium header
-    msg = await update.message.reply_text(
-        f"<b>━━━━━━ 🎬 𝗦𝗲𝗮𝗿𝗰𝗵 𝗥𝗲𝘀𝘂𝗹𝘁𝘀 ━━━━━━</b>\n\n"
-        f"✦ 𝗙𝗼𝘂𝗻𝗱 <b>{len(movies)}</b> results for '<b>{text}</b>'\n\n"
-        f"👇 <b>𝗦𝗲𝗹𝗲𝗰𝘁 𝗺𝗼𝘃𝗶𝗲:</b>",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-    
-    # Auto-delete (Optional - 2 min)
-    track_message_for_deletion(context, update.effective_chat.id, msg.message_id, USER_TEXT_DELETE_SECONDS)
+    result_format_start = time.perf_counter()
+    try:
+        if requester_id is not None:
+            context.user_data['search_results'] = movies
+            context.user_data['search_query'] = text
+            keyboard = create_movie_selection_keyboard(
+                movies, page=0, requester_id=requester_id
+            )
+        else:
+            keyboard = None
+        result_text = (
+            f"<b>🎬 Search results</b>\n\n"
+            f"Found <b>{len(movies)}</b> results for "
+            f"'<b>{html_escape(text[:200])}</b>'. Select the correct title:"
+        )
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Search timing stage=group_result_format query=%r format_ms=%.2f",
+                text[:80],
+                (time.perf_counter() - result_format_start) * 1000,
+            )
+        response_started = time.perf_counter()
+        msg = await _update_search_progress(
+            progress_message,
+            update.message,
+            result_text,
+            reply_markup=keyboard,
+            parse_mode='HTML',
+        )
+        if SEARCH_TIMING_ENABLED:
+            logger.info(
+                "Group search timing query=%r total_ms=%.2f response_ms=%.2f "
+                "fallback_ms=0 result=multiple",
+                text[:80],
+                (time.perf_counter() - search_started) * 1000,
+                (time.perf_counter() - response_started) * 1000,
+            )
+    except Exception:
+        logger.exception("Could not send group movie search results")
+        try:
+            await update.message.reply_text(
+                "⚠️ Search results could not be displayed. Please try again."
+            )
+        except Exception:
+            logger.exception("Could not send group result error response")
+        return
+    try:
+        track_message_for_deletion(
+            context,
+            update.effective_chat.id,
+            msg.message_id,
+            USER_TEXT_DELETE_SECONDS,
+        )
+    except Exception:
+        logger.exception("Could not schedule group result cleanup")
 
 async def group_member_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome new human members with a clickable display-name mention."""

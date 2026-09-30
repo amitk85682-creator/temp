@@ -46,6 +46,23 @@ def test_migration_versions_are_unique_and_ordered():
     versions = [version for version, _ in db_migrations.MIGRATIONS]
     assert versions == sorted(versions)
     assert len(versions) == len(set(versions))
+    assert versions[-1] == 10
+
+
+def test_identity_migration_adds_structural_episode_and_evidence_tables():
+    connection = MigrationConnection()
+
+    db_migrations._migration_10(connection)
+
+    queries = "\n".join(query for query, _ in connection.queries)
+    assert "CREATE TABLE IF NOT EXISTS seasons" in queries
+    assert "CREATE TABLE IF NOT EXISTS episodes" in queries
+    assert "CREATE TABLE IF NOT EXISTS file_episodes" in queries
+    assert "CREATE TABLE IF NOT EXISTS file_seasons" in queries
+    assert "CREATE TABLE IF NOT EXISTS ingestion_evidence" in queries
+    assert "CREATE TABLE IF NOT EXISTS content_identity_repair_archive" in queries
+    assert "ensure_file_episode_parent_match" in queries
+    assert "ensure_file_season_parent_match" in queries
 
 
 def test_already_applied_migrations_are_skipped(monkeypatch):

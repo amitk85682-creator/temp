@@ -6,15 +6,18 @@ MAIN_SOURCE = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(
 )
 
 
-def test_fast_search_separates_indexed_lookup_from_similarity_fallback():
+def test_fast_search_prioritizes_exact_and_prefix_before_fuzzy():
     search_source = MAIN_SOURCE[
         MAIN_SOURCE.index("def _get_movies_fast_sql_nocache"):
         MAIN_SOURCE.index("def get_movie_by_imdb_id", MAIN_SOURCE.index("def _get_movies_fast_sql_nocache"))
     ]
-    assert "exact_sql = " in search_source
-    assert "WHERE m.title ILIKE %s" in search_source
+    assert "exact_prefix_sql = " in search_source
+    assert "regexp_replace(LOWER(m.title), '[^a-z0-9]', '', 'g') = %s" in search_source
     assert "if not results:" in search_source
-    assert "fuzzy_sql = " in search_source
+    assert "LIKE %s" in search_source
+    assert "SIMILARITY(" in search_source
+    assert "ORDER BY CASE" in search_source
+    assert search_source.index("exact_prefix_sql = ") < search_source.index("stage = \"fuzzy\"")
     assert "OR SIMILARITY" not in search_source
 
 
