@@ -51,10 +51,20 @@ def bot_module():
 class _FakeBot:
     def __init__(self):
         self.messages = []
+        self.events = []
 
     async def send_message(self, **kwargs):
+        self.events.append("send_message")
         self.messages.append(kwargs)
         return SimpleNamespace(message_id=len(self.messages) + 100)
+
+    async def send_photo(self, **kwargs):
+        self.events.append("send_photo")
+        self.messages.append(kwargs)
+        return SimpleNamespace(message_id=len(self.messages) + 100)
+
+    async def delete_message(self, **kwargs):
+        self.events.append("delete_message")
 
 
 class _FakeMessage:
@@ -67,18 +77,26 @@ class _FakeMessage:
         self.edited_caption = []
         self.replies = []
         self.animations = []
+        self.deleted = False
+        self.events = []
 
     async def reply_text(self, text, **kwargs):
+        self.events.append("reply_text")
         self.replies.append((text, kwargs))
         return self
 
     async def reply_animation(self, animation, caption, **kwargs):
+        self.events.append("reply_animation")
         self.animations.append((animation, caption, kwargs))
         return SimpleNamespace(message_id=98)
 
     async def edit_text(self, text, **kwargs):
         self.edited_text.append((text, kwargs))
         return self
+
+    async def delete(self):
+        self.deleted = True
+        self.events.append("delete")
 
 
 class _FakeCallback:
@@ -91,15 +109,22 @@ class _FakeCallback:
         self.answered = []
         self.edited_text = []
         self.edited_caption = []
+        self.message.events = []
+        self.events = self.message.events
 
     async def answer(self, *args, **kwargs):
         self.answered.append((args, kwargs))
+        self.events.append("answer")
 
     async def edit_message_text(self, text, **kwargs):
+        if self.message.deleted:
+            raise RuntimeError("message was deleted")
         self.edited_text.append((text, kwargs))
         return self.message
 
     async def edit_message_caption(self, caption, **kwargs):
+        if self.message.deleted:
+            raise RuntimeError("message was deleted")
         self.edited_caption.append((caption, kwargs))
         return self.message
 
@@ -134,15 +159,17 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_animation_retry_no_results_replaces_caption_and_answers_callback(
+def test_animation_retry_no_results_deletes_media_and_sends_fresh_state(
     bot_module, monkeypatch
 ):
     bot = bot_module
     callback = _FakeCallback("retrysearch_Some%20%26%20%C3%89Title")
     context = _FakeContext()
+    context.bot.events = callback.events
     searched = []
 
     async def fake_run_async(function, title, **_kwargs):
+        callback.events.append("search")
         searched.append((function, title))
         return []
 
@@ -156,10 +183,15 @@ def test_animation_retry_no_results_replaces_caption_and_answers_callback(
 
     assert callback.answered
     assert searched[0][1] == "Some & ÉTitle"
-    assert callback.edited_caption
+    assert callback.message.deleted
+    assert not callback.edited_caption
     assert not callback.edited_text
-    assert "Some &amp; ÉTitle" in callback.edited_caption[0][0]
-    assert callback.edited_caption[0][1]["reply_markup"].inline_keyboard
+    assert context.bot.messages
+    assert "Some &amp; ÉTitle" in context.bot.messages[-1]["text"]
+    assert context.bot.messages[-1]["reply_markup"].inline_keyboard
+    assert callback.events.index("answer") < callback.events.index("delete")
+    assert callback.events.index("delete") < callback.events.index("search")
+    assert callback.events.index("search") < callback.events.index("send_message")
 
 
 def test_private_not_found_animation_shows_working_retry_button(bot_module, monkeypatch):
@@ -208,11 +240,15 @@ def test_retry_search_found_opens_movie_files(bot_module, monkeypatch):
     callback = _FakeCallback("retrysearch_Found%20Title")
     context = _FakeContext()
     sent = []
+    callback.events = callback.message.events
+    context.bot.events = callback.events
 
     async def fake_run_async(_function, _title, **_kwargs):
+        callback.events.append("search")
         return [(5, "Found Title", "url", "file")]
 
     async def fake_send_movie(*args):
+        callback.events.append("send_movie")
         sent.append(args[2:6])
 
     monkeypatch.setattr(bot, "run_async", fake_run_async)
@@ -225,8 +261,13 @@ def test_retry_search_found_opens_movie_files(bot_module, monkeypatch):
     _run(bot.button_callback(_callback_update(callback), context))
 
     assert callback.answered
-    assert callback.edited_caption
+    assert callback.message.deleted
+    assert not callback.edited_caption
+    assert not callback.edited_text
     assert sent and sent[0][0:2] == (5, "Found Title")
+    assert callback.events.index("answer") < callback.events.index("delete")
+    assert callback.events.index("delete") < callback.events.index("search")
+    assert callback.events.index("search") < callback.events.index("send_movie")
 
 
 def test_private_success_uses_shared_core_without_google_or_fuzzy(
@@ -268,6 +309,56 @@ def test_private_success_uses_shared_core_without_google_or_fuzzy(
     assert displayed and displayed[0][1]["status_message"] is progress
 
 
+def test_exact_movie_search_sends_existing_poster_and_keeps_file_buttons(
+    bot_module, monkeypatch
+):
+    bot = bot_module
+    poster_url = "https://cdn.example.test/reacher.jpg"
+    message = _FakeMessage("Reacher")
+    progress = _FakeMessage("Searching")
+    context = _FakeContext()
+    context.bot.username = "flimfybox_bot"
+    message.events = context.bot.events
+    progress.events = context.bot.events
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=message.chat,
+        effective_user=SimpleNamespace(id=10, first_name="Tester"),
+    )
+    run_async_calls = []
+    quality = ("HD Quality", "https://files.example.test/reacher", "file-id",
+               "1.2 GB", "English", "1080p")
+
+    async def fake_run_async(function, *args, **_kwargs):
+        run_async_calls.append((function, args))
+        return [quality], ("Series", poster_url)
+
+    async def unexpected_poster_processing(*_args, **_kwargs):
+        pytest.fail("stored poster URL should be sent without extra poster processing")
+
+    monkeypatch.setattr(bot, "run_async", fake_run_async)
+    monkeypatch.setattr(bot, "make_landscape_poster", unexpected_poster_processing)
+    monkeypatch.setattr(bot, "track_message_for_deletion", lambda *_args: None)
+
+    _run(bot.process_movie_exact_match(
+        update,
+        context,
+        27,
+        "Reacher",
+        status_message=progress,
+    ))
+
+    assert progress.deleted
+    assert context.bot.messages[0]["photo"] == poster_url
+    assert "Reacher" in context.bot.messages[0]["caption"]
+    assert run_async_calls == [(bot.get_movie_delivery_data, (27,))]
+    file_text, file_options = message.replies[-1]
+    assert "t.me/flimfybox_bot?start=file_27_0" in file_text
+    assert file_options["reply_markup"].inline_keyboard
+    assert context.bot.events.index("delete") < context.bot.events.index("send_photo")
+    assert context.bot.events.index("send_photo") < context.bot.events.index("reply_text")
+
+
 def test_retry_search_exception_answers_callback_and_shows_retry_state(
     bot_module, monkeypatch
 ):
@@ -283,8 +374,8 @@ def test_retry_search_exception_answers_callback_and_shows_retry_state(
     _run(bot.button_callback(_callback_update(callback), context))
 
     assert callback.answered
-    assert callback.edited_caption
-    assert "temporarily unavailable" in callback.edited_caption[0][0]
+    assert callback.message.deleted
+    assert "temporarily unavailable" in context.bot.messages[-1]["text"]
 
 
 def test_request_prefill_callback_preserves_title_and_can_be_confirmed(
@@ -295,17 +386,25 @@ def test_request_prefill_callback_preserves_title_and_can_be_confirmed(
     callback = _FakeCallback("request_prefill_" + bot.quote(title, safe=""))
     update = _callback_update(callback)
     context = _FakeContext()
+    context.bot.events = callback.events
     assert len(callback.data.encode("utf-8")) <= 64
 
     state = _run(bot.start_request_flow(update, context))
 
     assert callback.answered
+    assert callback.message.deleted
+    assert not callback.edited_caption
+    assert not callback.edited_text
     assert state == bot.CONFIRMATION
     assert context.user_data["temp_request_name"] == title
-    assert callback.edited_caption
-    assert "The Long Request Title" in callback.edited_caption[0][0]
+    assert "The Long Request Title" in context.bot.messages[-1]["text"]
+    assert callback.events.index("answer") < callback.events.index("delete")
+    assert callback.events.index("delete") < callback.events.index("send_message")
 
-    confirm = _FakeCallback("confirm_yes", message=callback.message)
+    confirm = _FakeCallback(
+        "confirm_yes",
+        message=_FakeMessage("Confirmation", chat_id=callback.message.chat.id),
+    )
     confirm.from_user = callback.from_user
     confirm_update = _callback_update(confirm)
     stored = []
@@ -325,7 +424,7 @@ def test_request_prefill_callback_preserves_title_and_can_be_confirmed(
     assert confirm.answered
     assert state == bot.ConversationHandler.END
     assert stored[0][3] == title
-    assert confirm.edited_caption
+    assert confirm.edited_text
 
 
 def _async_return(value):

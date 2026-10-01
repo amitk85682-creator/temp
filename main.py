@@ -5943,30 +5943,34 @@ async def process_movie_exact_match(
             len(qualities),
         )
     
-    response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
+    chat_id = update.effective_chat.id
     if status_message:
         try:
-            msg = await status_message.edit_text(
-                file_list_text,
-                reply_markup=keyboard_markup,
-                parse_mode='HTML',
-                disable_web_page_preview=True,
+            await status_message.delete()
+        except Exception:
+            logger.exception("Could not remove search progress before movie result")
+
+    if poster_url:
+        poster_caption = f"<b>{html_escape(title)}</b>"
+        if category:
+            poster_caption += f"\n{html_escape(category)}"
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=poster_url,
+                caption=poster_caption,
+                parse_mode="HTML",
             )
         except Exception:
-            logger.exception("Could not replace search progress with movie files")
-            msg = await update.message.reply_text(
-                file_list_text,
-                reply_markup=keyboard_markup,
-                parse_mode='HTML',
-                disable_web_page_preview=True,
-            )
-    else:
-        msg = await update.message.reply_text(
-            file_list_text,
-            reply_markup=keyboard_markup,
-            parse_mode='HTML',
-            disable_web_page_preview=True
-        )
+            logger.exception("Could not send stored poster for movie_id=%s", movie_id)
+
+    response_start = time.perf_counter() if SEARCH_TIMING_ENABLED else None
+    msg = await update.message.reply_text(
+        file_list_text,
+        reply_markup=keyboard_markup,
+        parse_mode='HTML',
+        disable_web_page_preview=True
+    )
     if timing is not None and response_start is not None:
         timing['response_ms'] = int((time.perf_counter() - response_start) * 1000)
     if SEARCH_TIMING_ENABLED and response_start is not None:
@@ -6097,10 +6101,11 @@ async def _replace_search_result_message(
     reply_markup=None,
     parse_mode="HTML",
     disable_web_page_preview=True,
+    force_new_message=False,
 ):
     """Edit text/caption when supported; otherwise send a replacement message."""
     message = getattr(query, "message", None)
-    if message:
+    if message and not force_new_message:
         has_caption = any(
             getattr(message, attribute, None)
             for attribute in ("animation", "photo", "video", "document", "audio", "voice")
@@ -6132,6 +6137,31 @@ async def _replace_search_result_message(
         parse_mode=parse_mode,
         disable_web_page_preview=disable_web_page_preview,
     )
+
+
+async def _delete_search_callback_message(query, context):
+    """Remove a callback's old search media before its replacement is sent."""
+    message = getattr(query, "message", None)
+    if not message:
+        return True
+    try:
+        await message.delete()
+        return True
+    except Exception:
+        logger.info("Could not delete old search-result message directly")
+
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(query, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        logger.error("Cannot delete old search-result message: chat or message id missing")
+        return False
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception:
+        logger.exception("Could not delete old search-result message")
+        return False
 
 
 async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6483,11 +6513,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             logger.exception("Could not acknowledge retry-search callback")
+        if not await _delete_search_callback_message(query, context):
+            return
         suggested_title = unquote(data[len("retrysearch_"):]).strip()
         try:
             if not suggested_title:
                 await _replace_search_result_message(
-                    query, context, "⚠️ Search suggestion was empty. Please search again."
+                    query,
+                    context,
+                    "⚠️ Search suggestion was empty. Please search again.",
+                    force_new_message=True,
                 )
                 return
             movies = await run_async(get_movies_fast_sql, suggested_title, limit=10)
@@ -6505,6 +6540,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Try another suggestion or request this title."
                     ),
                     reply_markup=_not_found_keyboard(suggested_title, suggestions),
+                    force_new_message=True,
                 )
                 return
 
@@ -6515,6 +6551,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     query,
                     context,
                     f"🔎 <b>{html_escape(title)}</b> found — getting its files…",
+                    force_new_message=True,
                 )
                 await send_movie_to_user(update, context, movie_id, title, url, file_id)
                 return
@@ -6531,6 +6568,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Select the correct title below:"
                 ),
                 reply_markup=create_movie_selection_keyboard(movies, page=0),
+                force_new_message=True,
             )
         except Exception:
             logger.exception("Retry search failed for callback")
@@ -6539,6 +6577,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     query,
                     context,
                     "⚠️ Search is temporarily unavailable. Please try again.",
+                    force_new_message=True,
                 )
             except Exception:
                 logger.exception("Could not show retry-search error state")
@@ -14532,12 +14571,15 @@ async def start_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Failed search results can open the request confirmation directly in chat.
     # The regular `request_` entry point remains unchanged and still asks for a name.
     if query.data.startswith("request_prefill_"):
+        if not await _delete_search_callback_message(query, context):
+            return ConversationHandler.END
         movie_title = unquote(query.data[len("request_prefill_"):]).strip()
         if not movie_title:
             await _replace_search_result_message(
                 query,
                 context,
                 "⚠️ The requested title was empty. Please search again.",
+                force_new_message=True,
             )
             return ConversationHandler.END
         context.user_data['temp_request_name'] = movie_title
@@ -14554,6 +14596,7 @@ async def start_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"Do you want to request <b>'{html_escape(movie_title)}'</b>?"
                 ),
                 reply_markup=keyboard,
+                force_new_message=True,
             )
             return CONFIRMATION
         except Exception:
